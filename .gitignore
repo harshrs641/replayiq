@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# Dev runtime artifacts
+.dev/
+backend/.dev/
+
+# Go binaries
+backend/replayiq-*
+replayiq-*
+*.exe
+
+# Node
+dashboard/node_modules/
+dashboard/dist/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code session files
+.claude/

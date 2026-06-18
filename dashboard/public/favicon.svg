@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Dark background pill -->
+  <rect width="32" height="32" rx="8" fill="#0f172a"/>
+  <!-- Replay arc (circular arrow, top-right) -->
+  <path d="M22 10.5 A8 8 0 1 0 24.5 17" fill="none" stroke="#3b82f6" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- Arrow head on the arc -->
+  <polyline points="21,7 22,10.5 25.5,9.5" fill="none" stroke="#3b82f6" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Play triangle -->
+  <polygon points="13,12.5 13,19.5 19.5,16" fill="#3b82f6"/>
+</svg>
