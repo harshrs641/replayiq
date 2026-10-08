@@ -20,7 +20,7 @@
 
   // ─── Constants ──────────────────────────────────────────────────────────────
   const SDK_VERSION = '1.0.0';
-  const RRWEB_CDN = 'https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js';
+  const RRWEB_CDN = 'https://cdn.jsdelivr.net/npm/rrweb@1.1.3/dist/rrweb.min.js';
   const BATCH_SIZE = 50;
   const FLUSH_INTERVAL_MS = 5000;
 

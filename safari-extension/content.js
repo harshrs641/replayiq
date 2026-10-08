@@ -35,14 +35,17 @@
     script.async = false;  // Make sure it's not async
     
     // The SDK script tag executes in the page's main world, so window.ReplayIQ
-    // exists there. This content script runs in an isolated world with its own
-    // window object, so it can never see window.ReplayIQ directly. The page's
-    // CSP also blocks inline <script> injection, so the init call is run via
-    // chrome.scripting.executeScript({ world: 'MAIN' }) from the background
-    // script instead, which bypasses the page CSP entirely.
+    // exists there, not in this isolated world. Init runs from init.js, a
+    // web-accessible extension script (exempt from the page's CSP) injected
+    // the same way, so it also lands in the main world.
     script.onload = () => {
-      console.log('[ReplayIQ] SDK script onload fired, requesting init in main world');
-      chrome.runtime.sendMessage({ action: 'initSDK' });
+      console.log('[ReplayIQ] SDK script onload fired, injecting init in main world');
+      const init = document.createElement('script');
+      init.src = chrome.runtime.getURL('init.js');
+      init.dataset.rrwebUrl = chrome.runtime.getURL('rrweb.min.js');
+      init.onload = () => init.remove();
+      init.onerror = (err) => console.error('[ReplayIQ] init.js load error:', err);
+      document.documentElement.appendChild(init);
     };
     
     script.onerror = (err) => {
