@@ -197,14 +197,248 @@ function SessionRow({ session, selected, onClick }) {
   );
 }
 
-// ── Session Replay Player ────────────────────────────────────────────────────
+// ── Session Replay Player (streaming) ────────────────────────────────────────
+//
+// Plays like a video stream instead of downloading the whole session first:
+//   1. GET .../replay/manifest: the timeline (start/end, keyframes) only.
+//   2. Load the first CHUNK_MS and start the player; its scrubber already
+//      spans the whole session thanks to an end marker event.
+//   3. While playing, keep AHEAD_MS loaded past the playhead (forward ranges).
+//   4. When the playhead lands in a part that isn't loaded (scrubber click,
+//      activity row, or playing past the buffer), pause, fetch from the
+//      nearest keyframe (.../replay/events?at=), then resume there.
+// rrweb can only start rendering at a Meta + FullSnapshot pair, which is what
+// the server's `at=` mode guarantees for every jump.
 
-function SessionReplay({ sessionId, onLoaded, playerApiRef, onTime }) {
+const CHUNK_MS = 20000;
+const AHEAD_MS = 15000;
+const END_MARKER_TAG = "riq-end";
+
+// Custom (type 5) events without { tag, payload } are the SDK's analytics
+// metadata, not replayable; rrweb-player crashes on them (data.tag of
+// undefined). Mobile wireframes are type 5 too and aren't displayed.
+const playable = e => e.type !== 5;
+
+function insertSorted(arr, evs) {
+  for (const e of evs) {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].timestamp <= e.timestamp) lo = mid + 1; else hi = mid;
+    }
+    arr.splice(lo, 0, e);
+  }
+}
+
+class ReplayStreamer {
+  constructor({ sessionId, masked, mount, width, onState }) {
+    Object.assign(this, { sessionId, masked, mount, width, onState });
+    this.player = null;
+    this.ranges = [];        // loaded [from, to) absolute ms, sorted, merged
+    this.events = [];        // every playable event loaded so far, sorted
+    this.loading = null;     // in-flight load promise
+    this.playing = false;
+    this.destroyed = false;
+    this.listeners = new Set();
+    this.loadedEvents = 0;
+  }
+
+  url(params) {
+    const q = new URLSearchParams({ masked: String(this.masked) });
+    for (const [k, v] of Object.entries(params)) q.set(k, String(Math.floor(v)));
+    return `${API}/api/v1/sessions/${this.sessionId}/replay/events?${q}`;
+  }
+
+  async fetchRange(params) {
+    const res = await fetch(this.url(params));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const evs = (data.events || []).sort((a, b) => a.timestamp - b.timestamp);
+    this.loadedEvents += evs.length;
+    return { from: data.from, to: data.to, events: evs.filter(playable) };
+  }
+
+  async start() {
+    const res = await fetch(`${API}/api/v1/sessions/${this.sessionId}/replay/manifest?masked=${this.masked}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const m = (this.manifest = await res.json());
+    if (!m.events) return { empty: "No events were recorded for this session." };
+    if (!m.keyframes.length) {
+      return { empty: "No full page snapshot was captured for this session (it may predate a fix, or recording was interrupted). Record a new session to replay it." };
+    }
+    // Cover at least one keyframe so there is something to render.
+    const to = Math.min(m.end + 1, Math.max(m.start, m.keyframes[0]) + CHUNK_MS);
+    const first = await this.fetchRange({ from: m.start, to });
+    if (this.destroyed) return {};
+    this.events = first.events;
+    this.zero = this.events[0]?.timestamp ?? m.start; // player time 0
+    // End marker: makes the scrubber span the whole session from the start.
+    insertSorted(this.events, [{ type: 5, timestamp: m.end, data: { tag: END_MARKER_TAG, payload: {} } }]);
+    this.ranges = [[m.start, to]];
+    this.createPlayer(0, false);
+    return { manifest: m };
+  }
+
+  createPlayer(offset, play) {
+    this.player?.$destroy?.();
+    this.mount.innerHTML = "";
+    const player = new RRWebPlayer({
+      target: this.mount,
+      props: {
+        events: [...this.events], width: this.width, height: 480, autoPlay: false,
+        // rrweb's virtual DOM (used to fast-forward on seek) throws
+        // "insertBefore ... node type does not support" when a seek lands on
+        // a later FullSnapshot once the first one has rendered; seeking
+        // straight into the iframe DOM works for every keyframe.
+        useVirtualDom: false,
+      },
+    });
+    this.player = player;
+    // The replayer keeps its own copy of the event array; jumps insert into
+    // it directly (see insertBehindPlayhead).
+    this.replayerEvents = player.getReplayer?.()?.service?.state?.context?.events || null;
+    player.addEventListener("ui-update-player-state", e => { this.playing = e.payload === "playing"; });
+    player.addEventListener("ui-update-current-time", e => this.onTime(this.zero + e.payload));
+    if (offset || play) player.goto(offset, play);
+  }
+
+  rangeAt(t) {
+    return this.ranges.find(([a, b]) => a <= t && t < b) || null;
+  }
+
+  addRange(from, to) {
+    const rs = [...this.ranges, [from, to]].sort((x, y) => x[0] - y[0]);
+    const merged = [];
+    for (const r of rs) {
+      const last = merged[merged.length - 1];
+      if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+      else merged.push([...r]);
+    }
+    this.ranges = merged;
+  }
+
+  nextRangeStart(t) {
+    const next = this.ranges.find(([a]) => a > t);
+    return next ? next[0] : this.manifest.end + 1;
+  }
+
+  keyframeAtOrBefore(t) {
+    let k = null;
+    for (const kf of this.manifest.keyframes) { if (kf <= t) k = kf; else break; }
+    return k ?? this.manifest.start;
+  }
+
+  emit() {
+    this.onState?.({
+      ranges: this.ranges.map(r => [...r]),
+      buffering: this.buffering,
+      failed: this.failed,
+      loadedEvents: this.loadedEvents,
+    });
+  }
+
+  onTime(t) {
+    this.now = t;
+    this.listeners.forEach(fn => fn(t));
+    if (this.destroyed || this.loading || !this.manifest) return;
+    t = Math.min(t, this.manifest.end);
+    const r = this.rangeAt(t);
+    if (r) {
+      if (r[1] <= this.manifest.end && r[1] - t < AHEAD_MS) this.loadForward(r);
+    } else {
+      this.jumpTo(t, this.playing);
+    }
+  }
+
+  // Extend a playing range; events land ahead of the playhead, so the
+  // replayer's addEvent schedules them normally.
+  loadForward(r) {
+    const from = r[1];
+    const to = Math.min(from + CHUNK_MS, this.nextRangeStart(from));
+    this.loading = this.fetchRange({ from, to })
+      .then(({ events }) => {
+        if (this.destroyed) return;
+        events.forEach(e => this.player.addEvent(e));
+        insertSorted(this.events, events);
+        this.addRange(from, to);
+      })
+      .catch(err => { console.error("replay prefetch failed", err); this.fail(); })
+      .finally(() => { this.loading = null; this.emit(); });
+  }
+
+  // Load around t (from its keyframe) and resume there.
+  async jumpTo(t, resume) {
+    const p = (async () => {
+      this.buffering = true;
+      this.emit();
+      this.player.pause();
+      const k = this.keyframeAtOrBefore(t);
+      const covering = this.ranges.find(([a, b]) => a <= k && k <= b);
+      let from, to, events;
+      if (covering) {
+        // Keyframe already loaded (or adjacent): just extend that range.
+        from = covering[1];
+        to = Math.min(Math.max(t, from) + CHUNK_MS, this.nextRangeStart(from));
+        ({ events } = await this.fetchRange({ from, to }));
+      } else {
+        to = Math.min(t + CHUNK_MS, this.nextRangeStart(t));
+        ({ from, events } = await this.fetchRange({ at: t, to }));
+      }
+      if (this.destroyed) return;
+      events = events.filter(e => e.timestamp >= this.zero);
+      insertSorted(this.events, events);
+      this.addRange(from, to);
+      this.insertBehindPlayhead(events, t - this.zero, resume);
+    })();
+    this.loading = p;
+    try { await p; }
+    catch (err) { console.error("replay jump failed", err); this.fail(); }
+    finally { this.loading = null; this.buffering = false; this.emit(); }
+  }
+
+  insertBehindPlayhead(events, offset, resume) {
+    if (this.replayerEvents) {
+      // Insert without casting: rrweb's addEvent would apply events older
+      // than its current baseline to the live DOM immediately, out of order.
+      insertSorted(this.replayerEvents, events);
+      this.player.goto(offset, resume);
+    } else {
+      // Unknown player internals: rebuild with everything loaded so far.
+      this.createPlayer(offset, resume);
+    }
+  }
+
+  // Surface a failed load for a few seconds; the next seek or time update
+  // retries it.
+  fail() {
+    this.failed = true;
+    clearTimeout(this.failTimer);
+    this.failTimer = setTimeout(() => { this.failed = false; this.emit(); }, 4000);
+  }
+
+  seekAbs(t) {
+    if (!this.manifest) return;
+    t = Math.max(this.manifest.start, Math.min(t, this.manifest.end));
+    if (this.rangeAt(t)) this.player.goto(t - this.zero, this.playing);
+    else if (!this.loading) this.jumpTo(t, this.playing);
+  }
+
+  destroy() {
+    this.destroyed = true;
+    clearTimeout(this.failTimer);
+    this.player?.$destroy?.();
+    this.player = null;
+    this.listeners.clear();
+  }
+}
+
+function SessionReplay({ sessionId, playerApiRef, onTime, onManifest }) {
   const wrapperRef = useRef(null); // always visible, safe to measure for width
   const containerRef = useRef(null); // hidden until ready, clientWidth would read 0
-  const playerRef = useRef(null);
   const [status, setStatus] = useState("loading"); // loading | ready | empty | error
   const [errorMessage, setErrorMessage] = useState("");
+  const [stream, setStream] = useState({ ranges: [], buffering: false, loadedEvents: 0 });
+  const [manifest, setManifest] = useState(null);
   // Defaults to masked - the server stores a redacted copy of every session
   // alongside the raw one (see backend/internal/masking) and serves that by
   // default; flipping this re-fetches the raw, unmasked copy instead.
@@ -213,68 +447,42 @@ function SessionReplay({ sessionId, onLoaded, playerApiRef, onTime }) {
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
+    setManifest(null);
+    const streamer = new ReplayStreamer({
+      sessionId, masked, mount: containerRef.current,
+      width: wrapperRef.current.clientWidth,
+      onState: s => { if (!cancelled) setStream(s); },
+    });
+    streamer.listeners.add(t => onTime?.(t));
 
-    (async () => {
-      try {
-        const res = await fetch(`${API}/api/v1/sessions/${sessionId}/replay?masked=${masked}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const all = (data.batches || [])
-          .flatMap(b => b.events || [])
-          .sort((a, b) => a.timestamp - b.timestamp);
-        // Behaviour / console / network tabs read the SDK's metadata events
-        // (and Meta events for navigation) before they're stripped below.
-        if (!cancelled) onLoaded?.(all);
-        const events = all
-          // type 5 (Custom) events are the SDK's synthetic network/console/
-          // behavior metadata for AI analysis, not real rrweb DOM events.
-          // rrweb-player expects Custom events to carry { tag, payload } in
-          // `data` and crashes (reading data.tag off undefined) on ones that
-          // don't - filter them out, they were never meant to be replayed.
-          .filter(e => e.type !== 5);
-
-        if (cancelled) return;
-
-        // rrweb needs a FullSnapshot (type 2) to reconstruct the initial DOM
-        // before it can apply incremental mutations on top of it - without
-        // one the player can't render anything, regardless of event count.
-        if (!events.some(e => e.type === 2)) {
-          setStatus("empty");
-          setErrorMessage("No full page snapshot was captured for this session (it may predate a fix, or recording was interrupted). Record a new session to replay it.");
-          return;
-        }
-
-        containerRef.current.innerHTML = "";
-        playerRef.current = new RRWebPlayer({
-          target: containerRef.current,
-          props: { events, width: wrapperRef.current.clientWidth, height: 480, autoPlay: false },
-        });
-        const player = playerRef.current;
-        player.addEventListener?.("ui-update-current-time", e => onTime?.(e.payload));
-        if (playerApiRef) {
-          playerApiRef.current = {
-            // offset is ms from the player's first event
-            seek: offset => player.goto(Math.max(0, offset), false),
-          };
-        }
-        setStatus("ready");
-      } catch (e) {
-        if (!cancelled) {
-          console.error("Failed to load replay:", e);
-          setErrorMessage(e.message || "Unknown error");
-          setStatus("error");
-        }
+    streamer.start().then(r => {
+      if (cancelled) return;
+      if (r.empty) {
+        setErrorMessage(r.empty);
+        setStatus("empty");
+        return;
       }
-    })();
+      setManifest(r.manifest);
+      onManifest?.(r.manifest);
+      streamer.emit();
+      if (playerApiRef) playerApiRef.current = { seek: t => streamer.seekAbs(t) };
+      setStatus("ready");
+    }).catch(e => {
+      if (cancelled) return;
+      console.error("Failed to load replay:", e);
+      setErrorMessage(e.message || "Unknown error");
+      setStatus("error");
+    });
 
     return () => {
       cancelled = true;
-      playerRef.current?.$destroy?.();
-      playerRef.current = null;
+      streamer.destroy();
       if (playerApiRef) playerApiRef.current = null;
       if (containerRef.current) containerRef.current.innerHTML = "";
     };
   }, [sessionId, masked]);
+
+  const span = manifest ? Math.max(1, manifest.end - manifest.start) : 1;
 
   return (
     <div ref={wrapperRef} style={{ position: "relative" }}>
@@ -319,12 +527,39 @@ function SessionReplay({ sessionId, onLoaded, playerApiRef, onTime }) {
           )}
         </div>
       )}
-      {/* Player mount point: React only ever sets attributes here, never
-          children - rrweb-player owns everything inside it imperatively. */}
-      <div ref={containerRef} style={{
-        background: C.bgSubtle, borderRadius: 8, border: `1px solid ${C.border}`,
-        overflow: "hidden", display: status === "ready" ? "block" : "none",
-      }} />
+      <div style={{ position: "relative", display: status === "ready" ? "block" : "none" }}>
+        {/* Player mount point: React only ever sets attributes here, never
+            children - rrweb-player owns everything inside it imperatively. */}
+        <div ref={containerRef} style={{
+          background: C.bgSubtle, borderRadius: 8, border: `1px solid ${C.border}`, overflow: "hidden",
+        }} />
+        {(stream.buffering || stream.failed) && (
+          <div style={{
+            position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)",
+            padding: "4px 12px", borderRadius: 12, background: C.ink, color: "#fff",
+            fontSize: 11, fontWeight: 600, pointerEvents: "none",
+            animation: stream.failed ? "none" : "pulse 1.2s infinite",
+          }}>{stream.failed ? "Couldn't load this part of the replay. Seek again to retry." : "Buffering…"}</div>
+        )}
+      </div>
+      {status === "ready" && manifest && (
+        <div style={{ marginTop: 8 }}>
+          {/* Loaded parts of the timeline, like a video player's buffer bar. */}
+          <div title="Loaded parts of the session" style={{ position: "relative", height: 4, borderRadius: 2, background: C.border, overflow: "hidden" }}>
+            {stream.ranges.map(([a, b], i) => (
+              <div key={i} style={{
+                position: "absolute", top: 0, bottom: 0, background: C.textFaint,
+                left: `${((a - manifest.start) / span) * 100}%`,
+                width: `${(Math.min(b, manifest.end + 1) - a) / span * 100}%`,
+              }} />
+            ))}
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 10, color: C.textFaint }}>
+            <span>Streaming · {stream.loadedEvents} of {manifest.events} events loaded</span>
+            <span>{manifest.keyframes.length} keyframe{manifest.keyframes.length === 1 ? "" : "s"}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -336,39 +571,39 @@ function clock(ms) {
   return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 }
 
-// Splits the session's raw events into the three activity lists. Offsets are
-// relative to the first replayable (non-Custom) event, which is what
-// rrweb-player's timeline starts at, so a row's time matches the scrubber.
-function buildActivity(events) {
-  const start = events.find(e => e.type !== 5)?.timestamp ?? events[0]?.timestamp ?? 0;
+// Splits the session's activity events into the three lists. `ts` is the
+// absolute time (used to seek and to highlight the row at the playhead);
+// `at` is relative to the session start, matching the player's clock.
+function buildActivity(events, sessionStart) {
+  const start = sessionStart ?? events.find(e => e.type !== 5)?.timestamp ?? events[0]?.timestamp ?? 0;
   const behaviour = [], consoleLogs = [], network = [];
   let lastHref = null;
   for (const e of events) {
-    const at = e.timestamp - start;
+    const ts = e.timestamp, at = ts - start;
     if (e.type === 4 && e.data?.href && e.data.href !== lastHref) {
       lastHref = e.data.href;
-      behaviour.push({ at, kind: "navigate", label: "Navigate", detail: e.data.href });
+      behaviour.push({ ts, at, kind: "navigate", label: "Navigate", detail: e.data.href });
       continue;
     }
     if (e.type !== 5) continue;
     switch (e.subtype) {
       case "click":
-        behaviour.push({ at, kind: "click", label: "Click", detail: e.selector });
+        behaviour.push({ ts, at, kind: "click", label: "Click", detail: e.selector });
         break;
       case "rage_click":
-        behaviour.push({ at, kind: "rage_click", label: "Rage click", detail: e.selector, strong: true });
+        behaviour.push({ ts, at, kind: "rage_click", label: "Rage click", detail: e.selector, strong: true });
         break;
       case "input":
-        behaviour.push({ at, kind: "input", label: "Input", detail: e.selector });
+        behaviour.push({ ts, at, kind: "input", label: "Input", detail: e.selector });
         break;
       case "console":
-        consoleLogs.push({ at, level: e.level || "log", message: e.message });
+        consoleLogs.push({ ts, at, level: e.level || "log", message: e.message });
         break;
       case "js_error":
-        consoleLogs.push({ at, level: "exception", message: e.message });
+        consoleLogs.push({ ts, at, level: "exception", message: e.message });
         break;
       case "network":
-        network.push({ at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration });
+        network.push({ ts, at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration });
         break;
     }
   }
@@ -391,10 +626,10 @@ const ACTIVITY_TABS = [
   { key: "network", label: "Network" },
 ];
 
-function ActivityPanel({ events, currentTime, onSeek }) {
+function ActivityPanel({ events, start, currentTime, onSeek }) {
   const [tab, setTab] = useState("behaviour");
   const [errorsOnly, setErrorsOnly] = useState(false);
-  const activity = useMemo(() => buildActivity(events || []), [events]);
+  const activity = useMemo(() => buildActivity(events || [], start), [events, start]);
 
   const errorCount = {
     behaviour: activity.behaviour.filter(b => b.kind === "rage_click").length,
@@ -412,7 +647,7 @@ function ActivityPanel({ events, currentTime, onSeek }) {
   // Last row at or before the playhead, highlighted as "now".
   let activeIdx = -1;
   if (typeof currentTime === "number") {
-    rows.forEach((r, i) => { if (r.at <= currentTime) activeIdx = i; });
+    rows.forEach((r, i) => { if (r.ts <= currentTime) activeIdx = i; });
   }
 
   const cell = { padding: "7px 10px", fontSize: 12, verticalAlign: "top" };
@@ -467,7 +702,7 @@ function ActivityPanel({ events, currentTime, onSeek }) {
                   : tab === "network" ? (!r.status || r.status >= 400)
                   : r.strong;
                 return (
-                  <tr key={i} onClick={() => onSeek?.(r.at)} title="Jump to this moment in the replay" style={{
+                  <tr key={i} onClick={() => onSeek?.(r.ts)} title="Jump to this moment in the replay" style={{
                     cursor: "pointer", borderBottom: `1px solid ${C.border}`,
                     background: i === activeIdx ? C.bgHover : "transparent",
                     boxShadow: isError ? `inset 3px 0 0 ${C.ink}` : "none",
@@ -504,10 +739,23 @@ function ActivityPanel({ events, currentTime, onSeek }) {
 
 function SessionDetail({ session, onAnalyze, onCreateJira }) {
   const [loading, setLoading] = useState(false);
-  const [replayEvents, setReplayEvents] = useState(null);
-  const [currentTime, setCurrentTime] = useState(null);
+  const [activityEvents, setActivityEvents] = useState(null);
+  const [replayStart, setReplayStart] = useState(null);
+  const [currentTime, setCurrentTime] = useState(null); // absolute ms
   const playerApiRef = useRef(null);
-  useEffect(() => { setReplayEvents(null); setCurrentTime(null); }, [session.session_id]);
+  // The activity tabs read a light feed (navigation + SDK-tagged events
+  // only), independent of how much of the replay has streamed in.
+  useEffect(() => {
+    let cancelled = false;
+    setActivityEvents(null);
+    setReplayStart(null);
+    setCurrentTime(null);
+    fetch(`${API}/api/v1/sessions/${session.session_id}/replay/activity`)
+      .then(r => (r.ok ? r.json() : { events: [] }))
+      .then(d => { if (!cancelled) setActivityEvents((d.events || []).sort((a, b) => a.timestamp - b.timestamp)); })
+      .catch(() => { if (!cancelled) setActivityEvents([]); });
+    return () => { cancelled = true; };
+  }, [session.session_id]);
   const analyzed = session.ai_status === "complete" && session.ai_summary;
 
   const handleAnalyze = async () => {
@@ -617,14 +865,15 @@ function SessionDetail({ session, onAnalyze, onCreateJira }) {
         <SectionHeader>Session Replay</SectionHeader>
         <SessionReplay
           sessionId={session.session_id}
-          onLoaded={setReplayEvents}
+          onManifest={m => setReplayStart(m.start)}
           onTime={setCurrentTime}
           playerApiRef={playerApiRef}
         />
         <ActivityPanel
-          events={replayEvents}
+          events={activityEvents}
+          start={replayStart}
           currentTime={currentTime}
-          onSeek={at => playerApiRef.current?.seek(at)}
+          onSeek={ts => playerApiRef.current?.seek(ts)}
         />
       </div>
     </div>

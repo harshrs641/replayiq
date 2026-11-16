@@ -80,6 +80,10 @@ func (r *router) handleSessionByID(w http.ResponseWriter, req *http.Request) {
 	case actionAnalyze:
 		r.triggerAnalysis(w, req, sessionID)
 	case actionReplay:
+		if len(parts) == 3 && parts[2] != "" {
+			r.replayStream(w, req, sessionID, parts[2])
+			return
+		}
 		r.replaySession(w, req, sessionID)
 	default:
 		writeError(w, http.StatusNotFound, "unknown action")
@@ -145,11 +149,30 @@ func (r *router) triggerAnalysis(w http.ResponseWriter, req *http.Request, sessi
 // time, so the handler never holds the full session in memory regardless
 // of session size.
 func (r *router) replaySession(w http.ResponseWriter, req *http.Request, sessionID string) {
-	masked := req.URL.Query().Get("masked") != "false"
+	useRaw := !r.useMaskedCopy(req.Context(), sessionID, req.URL.Query().Get("masked") != "false")
 	ctx := req.Context()
 
-	// Decide which bucket to stream from.
-	//
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	maskedVal := "true"
+	if useRaw {
+		maskedVal = "false"
+	}
+	fmt.Fprintf(w, `{"session_id":%q,"masked":%s,"batches":[`, sessionID, maskedVal)
+
+	if useRaw {
+		r.cfg.MinIO.StreamSessionEvents(ctx, sessionID, w)
+	} else {
+		r.cfg.MinIO.StreamSessionMaskedEvents(ctx, sessionID, w)
+	}
+
+	fmt.Fprint(w, "]}")
+}
+
+// useMaskedCopy reports whether the replay should be served from the masked
+// bucket.
+func (r *router) useMaskedCopy(ctx context.Context, sessionID string, masked bool) bool {
 	// When masked is requested we briefly poll for the masked objects: in the
 	// async (Kafka) pipeline the storage worker writes them shortly after
 	// ingest, so there is a small window right after session end where the
@@ -176,24 +199,7 @@ func (r *router) replaySession(w http.ResponseWriter, req *http.Request, session
 	}
 	// Fall back to raw only if: caller explicitly asked for raw, or masked
 	// events still don't exist (session predates masking feature).
-	useRaw := !masked || !hasMasked
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	maskedVal := "true"
-	if useRaw {
-		maskedVal = "false"
-	}
-	fmt.Fprintf(w, `{"session_id":%q,"masked":%s,"batches":[`, sessionID, maskedVal)
-
-	if useRaw {
-		r.cfg.MinIO.StreamSessionEvents(ctx, sessionID, w)
-	} else {
-		r.cfg.MinIO.StreamSessionMaskedEvents(ctx, sessionID, w)
-	}
-
-	fmt.Fprint(w, "]}")
+	return masked && hasMasked
 }
 
 // GET /api/v1/sessions/search?project_id=&q=&limit= — semantic search over

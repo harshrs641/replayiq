@@ -213,7 +213,18 @@ Sessions are analyzed automatically after they end, or on demand via the dashboa
 
 **Layer 3 — Full rrweb Stream** (~200KB, frame-accurate replay)
 
-Available at `GET /api/v1/sessions/:id/replay` for exact DOM reconstruction.
+Available at `GET /api/v1/sessions/:id/replay` for exact DOM reconstruction (whole session in one response).
+
+For playback, the dashboard streams it like a video instead: it loads the first 20 s, keeps 15 s loaded ahead of the playhead, and on a seek fetches only the part around the new position.
+
+| Endpoint | Returns |
+|---|---|
+| `GET .../replay/manifest` | Timeline only: `start`, `end`, `keyframes` (FullSnapshot timestamps playback can start from), per-batch ranges. Reads no events. |
+| `GET .../replay/events?from=&to=` | Events with `from <= timestamp < to` (to extend what is already playing). |
+| `GET .../replay/events?at=&to=` | Jump: starts at the last keyframe at or before `at`, with a Meta event first so the chunk plays on its own. `from` in the response says where it starts. |
+| `GET .../replay/activity` | Navigation plus SDK-tagged events (clicks, inputs, console, network) for the Behaviour/Console/Network tabs. |
+
+All accept `masked=true|false` like `/replay`. Each stored batch carries its time range and keyframes as object metadata, so the manifest is one listing call. Batches stored before this was added are read once to build their index, and the result is cached in memory.
 
 ### Trigger analysis manually
 

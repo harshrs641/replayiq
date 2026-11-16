@@ -575,8 +575,13 @@ func (m *MinIO) store(ctx context.Context, bucket, sessionID string, batch *mode
 	}
 	seq := storeKeySeq.Add(1)
 	key := fmt.Sprintf("sessions/%s/%d-%d.json.gz", sessionID, time.Now().UnixMilli(), seq)
+	// Time index for streaming replay (see replay_index.go).
+	headers := make([]eventHeader, len(batch.Events))
+	for i, e := range batch.Events {
+		headers[i] = eventHeader{Type: e.Type, Timestamp: e.Timestamp, Subtype: e.Subtype}
+	}
 	_, err := m.client.PutObject(ctx, bucket, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()),
-		minio.PutObjectOptions{ContentType: "application/gzip"},
+		minio.PutObjectOptions{ContentType: "application/gzip", UserMetadata: indexEvents(headers).toMetadata()},
 	)
 	return key, err
 }
