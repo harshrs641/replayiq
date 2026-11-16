@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -557,17 +559,38 @@ func (m *MinIO) StoreMaskedEvents(ctx context.Context, sessionID string, batch *
 // overwrote the first, quietly dropping events from storage.
 var storeKeySeq atomic.Uint64
 
+// store writes batch gzip-compressed. Event JSON compresses very well: rrweb
+// DOM payloads are repetitive, and mobile screenshot frames are near
+// duplicates of each other, so consecutive frames in one object shrink ~7x.
+// Readers go through openBatch, which also handles objects stored
+// uncompressed before this change.
 func (m *MinIO) store(ctx context.Context, bucket, sessionID string, batch *models.EventBatch) (string, error) {
-	data, err := json.Marshal(batch)
-	if err != nil {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(zw).Encode(batch); err != nil {
+		return "", err
+	}
+	if err := zw.Close(); err != nil {
 		return "", err
 	}
 	seq := storeKeySeq.Add(1)
-	key := fmt.Sprintf("sessions/%s/%d-%d.json", sessionID, time.Now().UnixMilli(), seq)
-	_, err = m.client.PutObject(ctx, bucket, key, bytes.NewReader(data), int64(len(data)),
-		minio.PutObjectOptions{ContentType: "application/json"},
+	key := fmt.Sprintf("sessions/%s/%d-%d.json.gz", sessionID, time.Now().UnixMilli(), seq)
+	_, err := m.client.PutObject(ctx, bucket, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()),
+		minio.PutObjectOptions{ContentType: "application/gzip"},
 	)
 	return key, err
+}
+
+// openBatch returns a reader over an object's JSON, transparently
+// decompressing gzip objects (detected by magic bytes, so legacy
+// uncompressed .json objects keep working).
+func openBatch(r io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(r)
+	magic, err := br.Peek(2)
+	if err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+		return gzip.NewReader(br)
+	}
+	return br, nil
 }
 
 func (m *MinIO) GetSessionEvents(ctx context.Context, sessionID string) ([]models.EventBatch, error) {
@@ -621,7 +644,9 @@ func (m *MinIO) getEvents(ctx context.Context, bucket, sessionID string) ([]mode
 			continue
 		}
 		var batch models.EventBatch
-		json.NewDecoder(reader).Decode(&batch)
+		if body, err := openBatch(reader); err == nil {
+			json.NewDecoder(body).Decode(&batch)
+		}
 		reader.Close()
 		batches = append(batches, batch)
 	}
@@ -681,7 +706,14 @@ func (m *MinIO) streamEvents(ctx context.Context, bucket, sessionID string, w io
 				return count, err
 			}
 		}
-		_, copyErr := io.Copy(w, reader)
+		body, openErr := openBatch(reader)
+		if openErr != nil {
+			reader.Close()
+			return count, openErr
+		}
+		// json.Encoder (used by store) appends a newline; it is valid JSON
+		// whitespace inside the array the caller is building.
+		_, copyErr := io.Copy(w, body)
 		reader.Close()
 		if copyErr != nil {
 			return count, copyErr

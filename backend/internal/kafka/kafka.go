@@ -63,6 +63,9 @@ func (p *Producer) writer(topic string) *kafkago.Writer {
 		Balancer:               &kafkago.Hash{}, // hash(key) → stable partition per session
 		RequiredAcks:           kafkago.RequireOne,
 		AllowAutoTopicCreation: true,
+		// Event batches (especially mobile screenshot frames) compress ~7x;
+		// consumers decompress transparently.
+		Compression: kafkago.Zstd,
 	}
 	p.writers[topic] = w
 	return w
