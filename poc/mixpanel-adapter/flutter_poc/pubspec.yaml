@@ -1,0 +1,23 @@
+name: replayiq_mobile_poc
+description: Demo app that records with Mixpanel's session replay SDK and uploads to ReplayIQ through the adapter.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.8.0
+  flutter: ">=3.38.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mixpanel_flutter_session_replay: ^2.1.0
+
+flutter:
+  uses-material-design: true
+
+# POC ONLY: vendored copy of mixpanel_flutter_session_replay 2.1.0 (Apache-2.0)
+# patched so plain (non-obscureText) TextFields are no longer force-masked.
+# See "REPLAYIQ POC PATCH" in third_party/.../internal/masking/mask_detector.dart.
+dependency_overrides:
+  mixpanel_flutter_session_replay:
+    path: third_party/mixpanel_flutter_session_replay

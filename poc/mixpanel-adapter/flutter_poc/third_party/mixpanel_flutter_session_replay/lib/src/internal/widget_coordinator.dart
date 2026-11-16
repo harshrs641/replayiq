@@ -1,0 +1,87 @@
+import 'package:flutter/foundation.dart' show ValueListenable;
+import 'package:flutter/rendering.dart';
+import 'package:flutter/widgets.dart';
+
+import '../models/debug_overlay_colors.dart';
+import '../models/masking_directive.dart';
+import '../models/results.dart';
+import '../models/session_event.dart' show TouchPosition;
+import 'capture/frame_acquirer.dart';
+import 'debug_mask_overlay.dart';
+import 'settings/settings_service.dart';
+import 'logger.dart';
+
+/// Abstract interface for widget-level coordinator operations
+///
+/// Defines the contract between widgets (LifecycleObserver, InteractionDetector,
+/// FrameMonitor) and the coordinator. Contains only the subset of coordinator
+/// functionality that widgets need.
+///
+/// This enables lightweight widget testing with simple fakes instead of
+/// requiring the full [SessionReplayCoordinator] with all its dependencies.
+abstract class WidgetCoordinator {
+  /// Current recording state
+  RecordingState get recordingState;
+
+  /// Remote settings state (pending, enabled, or disabled)
+  RemoteEnablementState get remoteEnablementState;
+
+  /// Whether app is currently in foreground
+  bool get isAppInForeground;
+
+  /// Whether a frame rendered during a capture is followed up with one more
+  /// capture. See [FrameAcquirer.followsUpFramesDuringCapture].
+  bool get followsUpFramesDuringCapture;
+
+  /// Whether [AppLifecycleState.inactive] counts as leaving the foreground,
+  /// or only [AppLifecycleState.hidden] does.
+  bool get leavesForegroundWhenInactive;
+
+  /// Creates the debug mask overlay for a capture boundary, drawn wherever
+  /// this coordinator's capture cannot see it.
+  DebugMaskOverlay createDebugMaskOverlay({
+    required ValueListenable<List<MaskRegionInfo>> regions,
+    required DebugOverlayColors colors,
+    required RenderBox? Function() boundary,
+  });
+
+  /// Logger instance
+  MixpanelLogger get logger;
+
+  /// Notifier for debug mask regions (for overlay visualization)
+  ValueNotifier<List<MaskRegionInfo>> get maskRegionsNotifier;
+
+  /// Handle app returning to foreground
+  void onAppForegrounded();
+
+  /// Handle app going to background
+  void onAppBackgrounded();
+
+  /// Capture a gesture boundary (down, lift, or cancel) that happened at
+  /// [timestamp]
+  void captureInteraction(
+    int interactionType,
+    Offset position,
+    DateTime timestamp,
+  );
+
+  /// Capture a batch of sampled drag positions, stamped with the time of its
+  /// final position
+  void captureTouchMove(List<TouchPosition> positions, DateTime timestamp);
+
+  /// Capture a screenshot from the given boundary
+  ///
+  /// [onRenderTreeRead] runs once the capture has read the render tree, if it
+  /// gets that far.
+  Future<void> captureSnapshot(
+    RenderRepaintBoundary boundary, {
+    required Element boundaryElement,
+    void Function()? onRenderTreeRead,
+  });
+
+  /// Notify coordinator of user activity (even when not recording).
+  ///
+  /// Used on web to restart recording after an idle timeout.
+  /// On native (or when no idle timeout is configured), this is a no-op.
+  void onUserActivity();
+}

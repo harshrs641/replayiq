@@ -1,0 +1,215 @@
+import 'dart:typed_data';
+import 'dart:ui' show Offset;
+
+import 'masking_directive.dart';
+import 'session_event.dart' show WireframePayload;
+
+/// Recording state machine for session replay
+///
+/// Represents the current state of session replay recording.
+/// Use this to understand what the SDK is doing and react accordingly.
+///
+/// State transitions:
+/// ```
+/// notRecording ──[sampling passes]──► initializing ──[DB done]──► recording
+///      ▲                                                              │  ▲
+///      │                                                              │  │
+///      │                                                              ▼  │
+///      │                                                            paused
+///      └──────────────────────────[stopRecording]─────────────────────┘
+///
+/// notRecording ──[sampling fails]──► notRecording (allows re-roll)
+/// ```
+enum RecordingState {
+  /// Not currently recording
+  ///
+  /// This is both the initial state and the state after stopping.
+  /// Calling `startRecording()` will evaluate sampling and potentially begin recording.
+  notRecording,
+
+  /// Sampling passed, session is being set up
+  ///
+  /// The SDK is persisting session metadata to the database.
+  /// Recording will begin shortly once this completes.
+  initializing,
+
+  /// Actively recording session replay data
+  ///
+  /// Screenshots and interactions are being captured and queued for upload.
+  recording,
+
+  /// Recording is temporarily paused
+  ///
+  /// The current replay is retained while a native app is backgrounded and
+  /// continues with the same replay ID on foreground. Screenshots and
+  /// interactions are not captured while paused. Only reached when
+  /// `MobileOptions.onBackground` is `ReplayBackgroundBehavior.pause`. Web
+  /// never pauses: a replay keeps recording while the page is hidden.
+  paused,
+}
+
+/// Initialization errors that can occur during SDK setup
+enum InitializationError {
+  /// Empty or malformed token
+  invalidToken,
+
+  /// Cannot initialize local storage
+  storageFailure,
+
+  /// Platform requirements not met (for example, macOS App Sandbox or the
+  /// browser capabilities required for non-blocking capture).
+  platformSecurityNotMet,
+
+  /// `serverUrl` was empty, not HTTPS, or otherwise malformed.
+  invalidServerUrl,
+}
+
+/// Capture errors (fail-safe - no unmasked data sent)
+enum CaptureError {
+  /// Widget tree traversal error
+  maskDetectionFailed,
+
+  /// Canvas rendering error
+  maskApplicationFailed,
+
+  /// No RepaintBoundary available
+  renderBoundaryNotFound,
+
+  /// OOM during capture
+  insufficientMemory,
+
+  /// Recording stopped or paused while the frame was still being acquired
+  cancelled,
+
+  /// JPEG encoding error
+  compressionFailed,
+}
+
+/// Result type for SDK initialization
+class InitializationResult<T> {
+  /// Whether initialization succeeded
+  final bool success;
+
+  /// SDK instance if initialization succeeded
+  final T? instance;
+
+  /// Error type if initialization failed
+  final InitializationError? error;
+
+  /// Human-readable error message
+  final String? errorMessage;
+
+  /// Create a successful initialization result
+  InitializationResult.success(this.instance)
+    : success = true,
+      error = null,
+      errorMessage = null;
+
+  /// Create a failed initialization result
+  InitializationResult.failure(this.error, this.errorMessage)
+    : success = false,
+      instance = null;
+
+  @override
+  String toString() {
+    if (success) return 'InitializationResult.success';
+    return 'InitializationResult.failure($error: $errorMessage)';
+  }
+}
+
+/// Result type for screenshot capture operations
+sealed class CaptureResult {
+  const CaptureResult();
+}
+
+/// Successful capture result
+final class CaptureSuccess extends CaptureResult {
+  /// Captured screenshot data (JPEG bytes)
+  final Uint8List data;
+
+  /// Width of the encoded image in pixels.
+  ///
+  /// Reported as replay metadata, so it must match [data]. It can differ from
+  /// the logical viewport when the raster is downscaled to bound capture work.
+  final int width;
+
+  /// Height of the encoded image in pixels.
+  ///
+  /// Reported as replay metadata, so it must match [data]. It can differ from
+  /// the logical viewport when the raster is downscaled to bound capture work.
+  final int height;
+
+  /// Image pixels per logical pixel, as `Offset(x, y)`.
+  ///
+  /// Every coordinate uploaded for a frame — replay metadata, interactions,
+  /// and wireframes — is expressed in image pixels, so coordinates taken from
+  /// the render tree are scaled by this first. `Offset(1, 1)` for a 1:1
+  /// capture, below 1 when the raster was downscaled to bound capture work.
+  final Offset imageScale;
+
+  /// Number of masked regions applied
+  final int maskCount;
+
+  /// Timestamp when creation of the platform image snapshot began.
+  final DateTime timestamp;
+
+  /// Mask regions that were detected (for debug overlay)
+  final List<MaskRegionInfo> maskRegions;
+
+  /// Session the frame was painted under, pinned at capture time
+  final String sessionId;
+
+  /// Distinct ID the frame was painted under, pinned at capture time
+  final String distinctId;
+
+  /// Wireframe payload for this frame, or `null` when wireframes are not
+  /// enabled or the emitter deduped against the previous frame.
+  final WireframePayload? wireframes;
+
+  const CaptureSuccess({
+    required this.data,
+    required this.width,
+    required this.height,
+    required this.maskCount,
+    required this.timestamp,
+    required this.sessionId,
+    required this.distinctId,
+    this.imageScale = const Offset(1, 1),
+    this.maskRegions = const [],
+    this.wireframes,
+  });
+
+  @override
+  String toString() {
+    return 'CaptureSuccess(${data.length} bytes, ${width}x$height, $maskCount masks)';
+  }
+}
+
+/// Failed capture result
+final class CaptureFailure extends CaptureResult {
+  /// Error type
+  final CaptureError error;
+
+  /// Human-readable error message
+  final String errorMessage;
+
+  const CaptureFailure(this.error, this.errorMessage);
+
+  @override
+  String toString() {
+    return 'CaptureFailure($error: $errorMessage)';
+  }
+}
+
+/// Result type for flush operations
+///
+/// Represents the completion of a flush operation. Currently provides no
+/// detailed information about the outcome, as flush is a best-effort operation
+/// that may partially succeed (some batches uploaded, others failed).
+///
+/// This class is intentionally kept simple to allow for future extension
+/// with more detailed result types (success, failure, skipped) without
+/// breaking existing code.
+class FlushResult {
+  const FlushResult();
+}

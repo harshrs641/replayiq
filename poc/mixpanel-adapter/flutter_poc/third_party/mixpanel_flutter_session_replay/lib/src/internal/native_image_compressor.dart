@@ -1,0 +1,62 @@
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+
+import 'capture/image_compressor.dart';
+
+/// Native image compressor using platform JPEG encoders.
+///
+/// Uses MethodChannel to call Android's Bitmap.compress() (libjpeg-turbo)
+/// or iOS/macOS's UIImage.jpegData for hardware-optimized encoding.
+///
+/// There is deliberately no pure-Dart fallback. Encoding a full-resolution
+/// frame in Dart takes far longer than the capture interval, so a persistently
+/// failing channel would turn every capture into a CPU-bound isolate job
+/// instead of a dropped frame. A failure returns null and the frame is
+/// skipped.
+class NativeImageCompressor extends ImageCompressor {
+  static const _channel = MethodChannel('com.mixpanel.flutter_session_replay');
+
+  /// JPEG quality (0-100).
+  /// iOS: 40 to match native SDK (ImageSettings.jpegCompressionRate = 0.4)
+  /// Android: 80 to match native SDK (Bitmap.compress quality = 80)
+  int get _jpegQuality => defaultTargetPlatform == TargetPlatform.iOS ? 40 : 80;
+
+  @override
+  Future<Uint8List?> compress(
+    Uint8List rgbaBytes, {
+    required int width,
+    required int height,
+  }) => compressToJpeg(
+    rgbaBytes,
+    width: width,
+    height: height,
+    quality: _jpegQuality,
+  );
+
+  Future<Uint8List?> compressToJpeg(
+    Uint8List rgbaBytes, {
+    required int width,
+    required int height,
+    required int quality,
+  }) async {
+    try {
+      return await _channel.invokeMethod<Uint8List>('compressImage', {
+        'rgbaBytes': rgbaBytes,
+        'width': width,
+        'height': height,
+        'quality': quality,
+      });
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Future<void> dispose() async {
+    try {
+      await _channel.invokeMethod<void>('disposeCache');
+    } catch (_) {
+      // Best-effort cleanup.
+    }
+  }
+}

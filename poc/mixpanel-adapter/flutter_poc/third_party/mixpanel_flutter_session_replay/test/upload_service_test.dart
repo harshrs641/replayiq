@@ -1,0 +1,1670 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:clock/clock.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart' as http_testing;
+import 'package:fake_async/fake_async.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:mixpanel_flutter_session_replay/src/internal/storage/event_queue_interface.dart';
+import 'package:mixpanel_flutter_session_replay/src/internal/upload/upload_service.dart';
+import 'package:mixpanel_flutter_session_replay/src/internal/upload/payload_serializer.dart';
+import 'package:mixpanel_flutter_session_replay/src/internal/settings/settings_service.dart';
+import 'package:mixpanel_flutter_session_replay/src/internal/logger.dart';
+import 'package:mixpanel_flutter_session_replay/src/version.dart';
+import 'package:mixpanel_flutter_session_replay/src/models/configuration.dart';
+import 'package:mixpanel_flutter_session_replay/src/models/session.dart';
+import 'package:mixpanel_flutter_session_replay/src/models/session_event.dart';
+
+import 'helpers/fake_http_client.dart';
+import 'helpers/fake_connectivity.dart';
+import 'helpers/in_memory_event_queue.dart';
+import 'helpers/lease_event_queue.dart';
+
+void main() {
+  group('UploadService', () {
+    late InMemoryEventQueue eventQueue;
+    late PayloadSerializer serializer;
+    late MixpanelLogger logger;
+
+    final testToken = 'test-token';
+    final testSessionId = 'session-1';
+    final testDistinctId = 'user-1';
+
+    setUp(() async {
+      eventQueue = InMemoryEventQueue();
+      await eventQueue.initialize();
+      serializer = PayloadSerializer(testToken);
+      logger = MixpanelLogger(LogLevel.none);
+    });
+
+    tearDown(() async {
+      await eventQueue.dispose();
+    });
+
+    /// Seed the event queue with a session and N interaction events
+    Future<Session> seedQueue({int eventCount = 1}) async {
+      final session = Session(
+        id: testSessionId,
+        startTime: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+        status: SessionStatus.active,
+      );
+      await eventQueue.createSessionMetadata(session);
+
+      for (var i = 0; i < eventCount; i++) {
+        await eventQueue.add(
+          SessionReplayEvent(
+            sessionId: testSessionId,
+            distinctId: testDistinctId,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(
+              2000 + (i * 100),
+              isUtc: true,
+            ),
+            type: EventType.interaction,
+            payload: InteractionPayload(
+              interactionType: 7,
+              x: 10.0 + i,
+              y: 20.0 + i,
+            ),
+          ),
+        );
+      }
+
+      return session;
+    }
+
+    UploadService createService({
+      required InMemoryEventQueue eventQueue,
+      int statusCode = 200,
+      bool wifiOnly = false,
+      RemoteEnablementState Function()? getRemoteEnablementState,
+      Duration flushInterval = const Duration(seconds: 10),
+      List<ConnectivityResult>? connectivity,
+      dynamic httpClient,
+      int? maxPayloadBytes,
+      int? maxEventsPerBatch,
+      String? serverUrl,
+    }) {
+      return UploadService(
+        eventQueue: eventQueue,
+        payloadSerializer: serializer,
+        wifiOnly: wifiOnly,
+        getRemoteEnablementState:
+            getRemoteEnablementState ?? () => RemoteEnablementState.enabled,
+        flushInterval: flushInterval,
+        maxPayloadBytes:
+            maxPayloadBytes ?? UploadService.defaultMaxPayloadBytes,
+        maxEventsPerBatch:
+            maxEventsPerBatch ?? UploadService.defaultMaxEventsPerBatch,
+        logger: logger,
+        httpClient: httpClient ?? createFakeHttpClient(statusCode: statusCode),
+        connectivity: connectivity != null
+            ? FakeConnectivity(connectivity)
+            : null,
+        serverUrl: serverUrl ?? 'https://api.mixpanel.com',
+      );
+    }
+
+    group('startAutoFlush and stopAutoFlush', () {
+      test('starts periodic timer that triggers uploads', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          flushInterval: Duration(seconds: 1),
+          httpClient: recorder.client,
+        );
+
+        // WHEN - elapse past the flush interval so the timer fires
+        fakeAsync((async) {
+          service.startAutoFlush();
+          async.elapse(Duration(seconds: 2));
+          async.flushMicrotasks();
+        });
+
+        // THEN - exactly 1 HTTP request was made and events were uploaded
+        expect(recorder.requests.length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test('ignores duplicate start calls without resetting timer', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          flushInterval: Duration(seconds: 2),
+          httpClient: recorder.client,
+        );
+
+        // WHEN - start, advance partway, then call start again
+        fakeAsync((async) {
+          service.startAutoFlush();
+          async.elapse(Duration(milliseconds: 1999));
+          service.startAutoFlush(); // Should be ignored, not reset timer
+          async.elapse(Duration(milliseconds: 1)); // Original timer fires at 2s
+          async.flushMicrotasks();
+        });
+
+        // THEN - timer fired at original 2s (was not reset)
+        expect(recorder.requests.length, 1);
+
+        service.dispose();
+      });
+
+      test(
+        'does not start timer when flushInterval is zero (disabled)',
+        () async {
+          // GIVEN
+          await seedQueue();
+          final recorder = createRecordingHttpClient(statusCode: 200);
+          final service = createService(
+            eventQueue: eventQueue,
+            flushInterval: Duration.zero,
+            httpClient: recorder.client,
+          );
+
+          // WHEN - start auto flush and elapse time
+          fakeAsync((async) {
+            service.startAutoFlush();
+            async.elapse(Duration(seconds: 10));
+            async.flushMicrotasks();
+          });
+
+          // THEN - no HTTP requests were made (auto-flush disabled)
+          expect(recorder.requests.length, 0);
+          expect(eventQueue.eventCount, 1); // Event still in queue
+
+          service.dispose();
+        },
+      );
+
+      test(
+        'does not start timer when flushInterval is negative (disabled)',
+        () async {
+          // GIVEN
+          await seedQueue();
+          final recorder = createRecordingHttpClient(statusCode: 200);
+          final service = createService(
+            eventQueue: eventQueue,
+            flushInterval: Duration(seconds: -5),
+            httpClient: recorder.client,
+          );
+
+          // WHEN - start auto flush and elapse time
+          fakeAsync((async) {
+            service.startAutoFlush();
+            async.elapse(Duration(seconds: 10));
+            async.flushMicrotasks();
+          });
+
+          // THEN - no HTTP requests were made (auto-flush disabled)
+          expect(recorder.requests.length, 0);
+          expect(eventQueue.eventCount, 1); // Event still in queue
+
+          service.dispose();
+        },
+      );
+
+      test('resolves sub-second flushInterval to 1 second', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          flushInterval: Duration(milliseconds: 500),
+          httpClient: recorder.client,
+        );
+
+        // WHEN - elapse 999ms (should NOT have fired yet at sub-second)
+        fakeAsync((async) {
+          service.startAutoFlush();
+          async.elapse(Duration(milliseconds: 999));
+          async.flushMicrotasks();
+
+          // THEN - no flush yet (resolved to 1s, not 500ms)
+          expect(recorder.requests.length, 0);
+
+          // Elapse 1ms more to hit 1 second
+          async.elapse(Duration(milliseconds: 1));
+          async.flushMicrotasks();
+
+          // THEN - now flushed at the 1s mark
+          expect(recorder.requests.length, 1);
+        });
+
+        service.dispose();
+      });
+
+      test('stopAutoFlush cancels the periodic timer', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          flushInterval: Duration(seconds: 1),
+          httpClient: recorder.client,
+        );
+
+        // WHEN - start then stop before interval, then elapse past the interval
+        fakeAsync((async) {
+          service.startAutoFlush();
+          async.elapse(Duration(milliseconds: 999));
+          service.stopAutoFlush();
+          async.elapse(Duration(milliseconds: 2));
+          async.flushMicrotasks();
+        });
+
+        // THEN - no HTTP requests were made (timer cancelled)
+        expect(recorder.requests.length, 0);
+
+        service.dispose();
+      });
+    });
+
+    group('flushOneBatch', () {
+      test('uploads events and removes them from queue', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - HTTP request was made with all 3 events
+        expect(recorder.requests.length, 1);
+        expect(decodeRequestEvents(recorder.requests.first).length, 3);
+        expect(eventQueue.eventCount, 0);
+      });
+
+      test('skips flush when already flushing', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN - start first flush, then immediately try second
+        final first = service.flushOneBatch();
+        final second = service
+            .flushOneBatch(); // Should skip (already flushing)
+        await Future.wait([first, second]);
+
+        // THEN - only one HTTP request was made (second flush was skipped)
+        expect(recorder.requests.length, 1);
+
+        service.dispose();
+      });
+
+      test('skips flush when in backoff period', () async {
+        // GIVEN - create service and trigger backoff
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 500);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // Trigger enough failures to activate backoff
+        await service.flushOneBatch();
+        await service.flushOneBatch();
+        final requestsBeforeBackoff = recorder.requests.length;
+
+        // WHEN - try to flush during backoff
+        await service.flushOneBatch();
+
+        // THEN - no additional HTTP request was made (backoff prevented it)
+        expect(recorder.requests.length, requestsBeforeBackoff);
+
+        service.dispose();
+      });
+
+      test('skips flush when wifiOnly and not on WiFi', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          wifiOnly: true,
+          connectivity: [ConnectivityResult.mobile],
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - no HTTP requests were made
+        expect(recorder.requests.length, 0);
+
+        service.dispose();
+      });
+
+      test('allows flush when wifiOnly and on WiFi', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          wifiOnly: true,
+          connectivity: [ConnectivityResult.wifi],
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - HTTP request was made and events were uploaded
+        expect(recorder.requests.length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test('allows flush when wifiOnly and on ethernet', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          wifiOnly: true,
+          connectivity: [ConnectivityResult.ethernet],
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - HTTP request was made and events were uploaded
+        expect(recorder.requests.length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test('skips flush when remote settings state is disabled', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          getRemoteEnablementState: () => RemoteEnablementState.disabled,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - no HTTP requests were made and events remain
+        expect(recorder.requests.length, 0);
+        expect(eventQueue.eventCount, 1);
+
+        service.dispose();
+      });
+
+      test('skips flush when remote settings state is pending', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          getRemoteEnablementState: () => RemoteEnablementState.pending,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - no HTTP requests were made and events remain
+        expect(recorder.requests.length, 0);
+        expect(eventQueue.eventCount, 1);
+
+        service.dispose();
+      });
+
+      test('allows flush when remote settings state is enabled', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          getRemoteEnablementState: () => RemoteEnablementState.enabled,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - HTTP request was made and events were uploaded
+        expect(recorder.requests.length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test('does not flush when queue is empty', () async {
+        // GIVEN - empty queue, no session metadata
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flushOneBatch();
+
+        // THEN - no HTTP requests were made
+        expect(recorder.requests.length, 0);
+
+        service.dispose();
+      });
+    });
+
+    group('flush', () {
+      test('uploads all events until queue is empty', () async {
+        // GIVEN
+        await seedQueue(eventCount: 5);
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN - exactly 1 HTTP request was made with all 5 events
+        expect(recorder.requests.length, 1);
+        expect(decodeRequestEvents(recorder.requests.first).length, 5);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test('returns FlushResult when no events exist', () async {
+        // GIVEN - empty queue
+        final service = createService(eventQueue: eventQueue);
+
+        // WHEN
+        final result = await service.flush();
+
+        // THEN
+        expect(result, isNotNull);
+
+        service.dispose();
+      });
+
+      test('skips flush when in backoff period', () async {
+        // GIVEN - trigger backoff
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 500);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // Trigger failures to activate backoff
+        await service.flushOneBatch();
+        await service.flushOneBatch();
+        final requestsBeforeBackoff = recorder.requests.length;
+
+        // WHEN - try full flush during backoff
+        await service.flush();
+
+        // THEN - no additional HTTP requests were made (backoff prevented it)
+        expect(recorder.requests.length, requestsBeforeBackoff);
+
+        service.dispose();
+      });
+
+      test('skips flush when remote settings state is disabled', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          getRemoteEnablementState: () => RemoteEnablementState.disabled,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        final result = await service.flush();
+
+        // THEN - no HTTP requests and all events remain
+        expect(result, isNotNull);
+        expect(recorder.requests.length, 0);
+        expect(eventQueue.eventCount, 3);
+
+        service.dispose();
+      });
+
+      test('skips flush when remote settings state is pending', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          getRemoteEnablementState: () => RemoteEnablementState.pending,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        final result = await service.flush();
+
+        // THEN - no HTTP requests and all events remain
+        expect(result, isNotNull);
+        expect(recorder.requests.length, 0);
+        expect(eventQueue.eventCount, 3);
+
+        service.dispose();
+      });
+
+      test('allows flush when remote settings state is enabled', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          getRemoteEnablementState: () => RemoteEnablementState.enabled,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        final result = await service.flush();
+
+        // THEN - HTTP request was made and all events uploaded
+        expect(result, isNotNull);
+        expect(recorder.requests.length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test('stops uploading on network error', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: createFailingHttpClient(),
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN - all 3 events still in queue (upload failed)
+        expect(eventQueue.eventCount, 3);
+
+        service.dispose();
+      });
+    });
+
+    group('upload behavior', () {
+      test('sends POST request to default US record endpoint', () async {
+        // GIVEN
+        final expectedEndpoint = 'api.mixpanel.com';
+        final expectedPath = '/record';
+        await seedQueue();
+
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN
+        expect(recorder.requests.length, 1);
+        final request = recorder.requests.first;
+        expect(request.url.host, expectedEndpoint);
+        expect(request.url.path, expectedPath);
+      });
+
+      test('sends POST request to custom serverUrl record endpoint', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+          serverUrl: 'https://api-eu.mixpanel.com',
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN
+        final request = recorder.requests.first;
+        expect(request.url.host, 'api-eu.mixpanel.com');
+        expect(request.url.path, '/record');
+      });
+
+      test(
+        'preserves a path on the serverUrl when building the record endpoint',
+        () async {
+          // KEY behavior — matches Android, diverges from iOS. Proxy URLs with
+          // a path must hit `<base>/<path>/record`, not have the path dropped.
+          // GIVEN
+          await seedQueue();
+          final recorder = createRecordingHttpClient(statusCode: 200);
+          final service = createService(
+            eventQueue: eventQueue,
+            httpClient: recorder.client,
+            serverUrl: 'https://proxy.example.com/mp',
+          );
+
+          // WHEN
+          await service.flush();
+
+          // THEN
+          final request = recorder.requests.first;
+          expect(request.url.host, 'proxy.example.com');
+          expect(request.url.path, '/mp/record');
+        },
+      );
+
+      test('includes correct query parameters', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN
+        final params = recorder.requests.first.url.queryParameters;
+        expect(params['format'], 'gzip');
+        expect(params['distinct_id'], testDistinctId);
+        expect(params['seq'], '0');
+        expect(params['replay_id'], testSessionId);
+        expect(params['\$lib_version'], sdkVersion);
+        expect(params['\$os'], anyOf('Android', 'iOS', 'Mac OS X'));
+      });
+
+      test('includes authorization header', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN
+        final headers = recorder.requests.first.headers;
+        expect(headers['Authorization'], startsWith('Basic '));
+        expect(headers['Content-Type'], 'application/octet-stream');
+      });
+
+      test('persists sequence number on success', () async {
+        // GIVEN
+        final expectedSequenceNumber = 0;
+        await seedQueue();
+        final service = createService(eventQueue: eventQueue);
+
+        // WHEN
+        await service.flush();
+
+        // THEN
+        final seqNumber = await eventQueue.getLastSequenceNumber(testSessionId);
+        expect(seqNumber, expectedSequenceNumber);
+      });
+
+      test('increments sequence number across batches', () async {
+        // GIVEN
+        final expectedFirstSeq = 0;
+        final expectedSecondSeq = 1;
+        await seedQueue();
+        final service = createService(eventQueue: eventQueue);
+
+        // First upload
+        await service.flush();
+        final firstSeq = await eventQueue.getLastSequenceNumber(testSessionId);
+        expect(firstSeq, expectedFirstSeq);
+
+        // WHEN - add more events and flush again
+        await eventQueue.add(
+          SessionReplayEvent(
+            sessionId: testSessionId,
+            distinctId: testDistinctId,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(5000, isUtc: true),
+            type: EventType.interaction,
+            payload: InteractionPayload(interactionType: 7, x: 1.0, y: 2.0),
+          ),
+        );
+        await service.flush();
+
+        // THEN
+        final secondSeq = await eventQueue.getLastSequenceNumber(testSessionId);
+        expect(secondSeq, expectedSecondSeq);
+
+        service.dispose();
+      });
+
+      test('does not remove events on 429 rate limit', () async {
+        // GIVEN
+        await seedQueue(eventCount: 2);
+        final recorder = createRecordingHttpClient(statusCode: 429);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN - exactly 1 request was attempted with 2 events, but events remain
+        expect(recorder.requests.length, 1);
+        expect(decodeRequestEvents(recorder.requests.first).length, 2);
+        expect(eventQueue.eventCount, 2);
+
+        service.dispose();
+      });
+
+      test('does not remove events on 500 server error', () async {
+        // GIVEN
+        await seedQueue(eventCount: 2);
+        final recorder = createRecordingHttpClient(statusCode: 500);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN - exactly 1 request was attempted with 2 events, but events remain
+        expect(recorder.requests.length, 1);
+        expect(decodeRequestEvents(recorder.requests.first).length, 2);
+        expect(eventQueue.eventCount, 2);
+
+        service.dispose();
+      });
+
+      test('does not remove events on 4xx client error', () async {
+        // GIVEN
+        await seedQueue(eventCount: 2);
+        final recorder = createRecordingHttpClient(statusCode: 400);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN - exactly 1 request was attempted with 2 events, but events remain
+        expect(recorder.requests.length, 1);
+        expect(decodeRequestEvents(recorder.requests.first).length, 2);
+        expect(eventQueue.eventCount, 2);
+
+        service.dispose();
+      });
+
+      test('does not remove events on network exception', () async {
+        // GIVEN
+        await seedQueue(eventCount: 2);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: createFailingHttpClient(),
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN - all 2 events remain in queue
+        expect(eventQueue.eventCount, 2);
+
+        service.dispose();
+      });
+
+      test(
+        'rebuilds missing session metadata and uploads the events',
+        () async {
+          // GIVEN - add event without creating session metadata
+          await eventQueue.add(
+            SessionReplayEvent(
+              sessionId: 'orphan-session',
+              distinctId: testDistinctId,
+              timestamp: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+              type: EventType.interaction,
+              payload: InteractionPayload(interactionType: 7, x: 1.0, y: 2.0),
+            ),
+          );
+
+          final service = createService(eventQueue: eventQueue);
+
+          // WHEN
+          await service.flush();
+
+          // THEN - the orphaned event uploads as the first batch of a replay
+          // that starts at its timestamp, instead of blocking the queue
+          expect(eventQueue.eventCount, 0);
+          final session = await eventQueue.getSessionMetadata('orphan-session');
+          expect(
+            session?.startTime,
+            DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+          );
+          expect(await eventQueue.getLastSequenceNumber('orphan-session'), 0);
+
+          service.dispose();
+        },
+      );
+
+      test('uploads screenshot binary data correctly', () async {
+        // GIVEN
+        final imageData = Uint8List.fromList(
+          List.generate(100, (i) => i % 256),
+        );
+        final session = Session(
+          id: testSessionId,
+          startTime: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+          status: SessionStatus.active,
+        );
+        await eventQueue.createSessionMetadata(session);
+        await eventQueue.add(
+          SessionReplayEvent(
+            sessionId: testSessionId,
+            distinctId: testDistinctId,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(2000, isUtc: true),
+            type: EventType.screenshot,
+            payload: ScreenshotPayload(imageData: imageData),
+          ),
+        );
+
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN
+        await service.flush();
+
+        // THEN - request sent with 1 screenshot event
+        expect(recorder.requests.length, 1);
+        expect(decodeRequestEvents(recorder.requests.first).length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+    });
+
+    group('backoff', () {
+      test('no backoff before failure threshold', () async {
+        // GIVEN - one failure (threshold is 2)
+        await seedQueue(eventCount: 2);
+        final service = createService(eventQueue: eventQueue, statusCode: 500);
+
+        // First failure
+        await service.flushOneBatch();
+        expect(eventQueue.eventCount, 2); // Events remain
+
+        // WHEN - second flush attempt (only 1 failure so far, below threshold)
+        final service2 = createService(eventQueue: eventQueue, statusCode: 200);
+        await service2.flushOneBatch();
+
+        // THEN - events uploaded (no backoff was blocking)
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+        service2.dispose();
+      });
+
+      test('backoff activates after failure threshold', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 500);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // Trigger 2 failures (threshold for backoff)
+        await service.flushOneBatch();
+        await service.flushOneBatch();
+        final requestsBeforeBackoff = recorder.requests.length;
+
+        // WHEN - try to flush during backoff
+        await service.flushOneBatch();
+
+        // THEN - no additional HTTP request was made (backoff prevented it)
+        expect(recorder.requests.length, requestsBeforeBackoff);
+
+        service.dispose();
+      });
+
+      test('backoff resets on successful upload', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final service = createService(eventQueue: eventQueue, statusCode: 200);
+
+        // Upload successfully
+        await service.flushOneBatch();
+
+        // Add more events
+        await eventQueue.add(
+          SessionReplayEvent(
+            sessionId: testSessionId,
+            distinctId: testDistinctId,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(9000, isUtc: true),
+            type: EventType.interaction,
+            payload: InteractionPayload(interactionType: 7, x: 1.0, y: 2.0),
+          ),
+        );
+
+        // WHEN - flush again (should succeed, no backoff)
+        await service.flushOneBatch();
+
+        // THEN - all events uploaded
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test('backoff period expires and allows flush', () async {
+        // GIVEN - trigger backoff with one service
+        await seedQueue(eventCount: 3);
+        final failingService = createService(
+          eventQueue: eventQueue,
+          httpClient: createFakeHttpClient(statusCode: 500),
+        );
+
+        // Trigger 2 failures to activate backoff
+        await failingService.flushOneBatch();
+        await failingService.flushOneBatch();
+
+        // Verify all 3 events remain
+        expect(eventQueue.eventCount, 3);
+
+        // WHEN - use a new service (no backoff state) to flush
+        final successService = createService(
+          eventQueue: eventQueue,
+          statusCode: 200,
+        );
+        await successService.flushOneBatch();
+
+        // THEN - events uploaded (new service has no backoff)
+        expect(eventQueue.eventCount, 0);
+
+        failingService.dispose();
+        successService.dispose();
+      });
+    });
+
+    group('concurrent flush', () {
+      test('concurrent flush waits for in-progress flush to complete', () async {
+        // GIVEN
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+        );
+
+        // WHEN - start two flushes concurrently
+        final future1 = service.flush();
+        final future2 = service.flush(); // Should wait for first flush
+        await Future.wait([future1, future2]);
+
+        // THEN - exactly 1 HTTP request was made (second flush waited on first)
+        expect(recorder.requests.length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+    });
+
+    group('falling behind detection', () {
+      test(
+        'schedules immediate flush when oldest event age exceeds flush interval',
+        () async {
+          // GIVEN - events with old timestamps (long ago)
+          final session = Session(
+            id: testSessionId,
+            startTime: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+            status: SessionStatus.active,
+          );
+          await eventQueue.createSessionMetadata(session);
+
+          // Create events with old timestamps to trigger "falling behind"
+          for (var i = 0; i < 3; i++) {
+            await eventQueue.add(
+              SessionReplayEvent(
+                sessionId: testSessionId,
+                distinctId: testDistinctId,
+                timestamp: DateTime.fromMillisecondsSinceEpoch(
+                  1000 + (i * 100), // Very old timestamps
+                  isUtc: true,
+                ),
+                type: EventType.interaction,
+                payload: InteractionPayload(
+                  interactionType: 7,
+                  x: 10.0 + i,
+                  y: 20.0 + i,
+                ),
+              ),
+            );
+          }
+
+          // Use a short flush interval so events appear "old"
+          final recorder = createRecordingHttpClient(statusCode: 200);
+          final service = createService(
+            eventQueue: eventQueue,
+            flushInterval: Duration(seconds: 1),
+            httpClient: recorder.client,
+          );
+
+          // WHEN - flush one batch, which should detect falling behind
+          await service.flushOneBatch();
+
+          // Flush the scheduled follow-up flush (Future.microtask)
+          await pumpEventQueue();
+
+          // THEN - exactly 1 HTTP request was made and all events uploaded
+          expect(recorder.requests.length, 1);
+          expect(eventQueue.eventCount, 0);
+
+          service.dispose();
+        },
+      );
+    });
+
+    group('flush mid-batch backoff', () {
+      test(
+        'flush stops when backoff activates during multi-batch upload',
+        () async {
+          // GIVEN - seed events, use a failing server to trigger backoff mid-flush
+          await seedQueue(eventCount: 3);
+          final recorder = createRecordingHttpClient(statusCode: 500);
+
+          final service = createService(
+            eventQueue: eventQueue,
+            httpClient: recorder.client,
+          );
+
+          // WHEN - flush encounters server errors and triggers backoff
+          await service.flush();
+
+          // THEN - exactly 1 request made (flush breaks on first server error)
+          expect(recorder.requests.length, 1);
+          expect(eventQueue.eventCount, 3);
+
+          service.dispose();
+        },
+      );
+    });
+
+    group('batch limits', () {
+      test(
+        'respects maxEventsPerBatch by splitting into multiple batches',
+        () async {
+          // GIVEN - 5 events with a max of 2 per batch
+          await seedQueue(eventCount: 5);
+          final recorder = createRecordingHttpClient(statusCode: 200);
+          final service = createService(
+            eventQueue: eventQueue,
+            httpClient: recorder.client,
+            maxEventsPerBatch: 2,
+          );
+
+          // WHEN - flush all events
+          await service.flush();
+
+          // THEN - 3 batches: 2 + 2 + 1 events
+          expect(recorder.requests.length, 3);
+          expect(decodeRequestEvents(recorder.requests[0]).length, 2);
+          expect(decodeRequestEvents(recorder.requests[1]).length, 2);
+          expect(decodeRequestEvents(recorder.requests[2]).length, 1);
+          expect(eventQueue.eventCount, 0);
+
+          service.dispose();
+        },
+      );
+
+      test('respects maxPayloadBytes by splitting into multiple batches', () async {
+        // GIVEN - 3 interaction events (~100 bytes each), max 150 bytes per batch
+        await seedQueue(eventCount: 3);
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          httpClient: recorder.client,
+          maxPayloadBytes: 150,
+        );
+
+        // WHEN - flush all events
+        await service.flush();
+
+        // THEN - first batch fits 1 event (100 bytes), second would exceed on 2nd event
+        // so each batch gets 1 event = 3 batches
+        expect(recorder.requests.length, 3);
+        expect(decodeRequestEvents(recorder.requests[0]).length, 1);
+        expect(decodeRequestEvents(recorder.requests[1]).length, 1);
+        expect(decodeRequestEvents(recorder.requests[2]).length, 1);
+        expect(eventQueue.eventCount, 0);
+
+        service.dispose();
+      });
+
+      test(
+        'flushOneBatch uploads only one batch when limit is smaller than total events',
+        () async {
+          // GIVEN - 5 events with a max of 2 per batch
+          await seedQueue(eventCount: 5);
+          final recorder = createRecordingHttpClient(statusCode: 200);
+          final service = createService(
+            eventQueue: eventQueue,
+            httpClient: recorder.client,
+            maxEventsPerBatch: 2,
+          );
+
+          // WHEN - flush one batch only
+          await service.flushOneBatch();
+
+          // THEN - only 1 request with 2 events, 3 events remain
+          expect(recorder.requests.length, 1);
+          expect(decodeRequestEvents(recorder.requests.first).length, 2);
+          expect(eventQueue.eventCount, 3);
+
+          service.dispose();
+        },
+      );
+    });
+
+    group('upload lease', () {
+      test('acquires and releases the lease as the queue owner', () async {
+        // GIVEN a shared queue whose owner id survives page reloads
+        final leaseQueue = LeaseEventQueue(uploadLeaseOwnerId: 'tab-42');
+        await leaseQueue.initialize();
+        final session = Session(
+          id: testSessionId,
+          startTime: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+          status: SessionStatus.active,
+        );
+        await leaseQueue.createSessionMetadata(session);
+        await leaseQueue.add(
+          SessionReplayEvent(
+            sessionId: testSessionId,
+            distinctId: testDistinctId,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(2000, isUtc: true),
+            type: EventType.interaction,
+            payload: InteractionPayload(interactionType: 7, x: 1, y: 2),
+          ),
+        );
+        final service = createService(eventQueue: leaseQueue);
+
+        // WHEN one batch is uploaded
+        await service.flushOneBatch();
+
+        // THEN the lease was taken and released under the queue's identity,
+        // not a per-service one that a reload would lose
+        expect(leaseQueue.acquireOwnerIds, contains('tab-42'));
+        expect(leaseQueue.acquireOwnerIds.toSet(), {'tab-42'});
+        expect(leaseQueue.releaseOwnerIds, ['tab-42']);
+        // AND the lease is scoped to the session being uploaded
+        expect(leaseQueue.acquireSessionIds.toSet(), {testSessionId});
+        expect(leaseQueue.releaseSessionIds, [testSessionId]);
+        expect(leaseQueue.eventCount, 0);
+      });
+
+      test('reports busy when another owner holds the lease', () async {
+        final leaseQueue = LeaseEventQueue()..acquireResults.add(false);
+        await leaseQueue.initialize();
+        final session = Session(
+          id: testSessionId,
+          startTime: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+          status: SessionStatus.active,
+        );
+        await leaseQueue.createSessionMetadata(session);
+        await leaseQueue.add(
+          SessionReplayEvent(
+            sessionId: testSessionId,
+            distinctId: testDistinctId,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(2000, isUtc: true),
+            type: EventType.interaction,
+            payload: InteractionPayload(interactionType: 7, x: 1, y: 2),
+          ),
+        );
+        final service = createService(eventQueue: leaseQueue);
+
+        await service.flushOneBatch();
+
+        expect(leaseQueue.eventCount, 1, reason: 'nothing uploaded');
+        expect(leaseQueue.releaseOwnerIds, isEmpty);
+      });
+
+      test(
+        'uploads the next session when another owner holds the oldest lease',
+        () async {
+          // GIVEN an expired session another tab is draining sits ahead of
+          // this tab's own session in the queue
+          final leaseQueue = LeaseEventQueue()
+            ..busySessionIds.add('contended-session');
+          await leaseQueue.initialize();
+          for (final (id, timestamp) in [
+            ('contended-session', 1000),
+            ('own-session', 2000),
+          ]) {
+            await leaseQueue.createSessionMetadata(
+              Session(
+                id: id,
+                startTime: DateTime.fromMillisecondsSinceEpoch(
+                  timestamp,
+                  isUtc: true,
+                ),
+                status: SessionStatus.active,
+              ),
+            );
+            await leaseQueue.add(
+              SessionReplayEvent(
+                sessionId: id,
+                distinctId: testDistinctId,
+                timestamp: DateTime.fromMillisecondsSinceEpoch(
+                  timestamp + 1,
+                  isUtc: true,
+                ),
+                type: EventType.interaction,
+                payload: InteractionPayload(interactionType: 7, x: 1, y: 2),
+              ),
+            );
+          }
+          final service = createService(eventQueue: leaseQueue);
+
+          // WHEN a flush runs while the other tab holds the first lease
+          await service.flush();
+
+          // THEN the busy session is left alone and this tab's replay is
+          // uploaded instead of waiting behind it; the flush ends once the
+          // contended session is all that remains
+          expect(leaseQueue.acquireSessionIds, [
+            'contended-session',
+            'own-session',
+            'contended-session',
+          ]);
+          expect(leaseQueue.releaseSessionIds, ['own-session']);
+          expect(
+            (await leaseQueue.fetchOldestHeader())?.sessionId,
+            'contended-session',
+            reason: 'only the contended session still has events queued',
+          );
+        },
+      );
+      test(
+        'should stop at the flush cutoff when skipping a session another tab '
+        'has leased',
+        () async {
+          // GIVEN a contended session another tab is draining ahead of this
+          // tab's own session, which keeps recording while the flush runs
+          final leaseQueue = _RecordingDuringCommitQueue()
+            ..busySessionIds.add('contended-session');
+          await leaseQueue.initialize();
+          for (final (id, timestamp) in [
+            ('contended-session', 1000),
+            ('own-session', 2000),
+          ]) {
+            await leaseQueue.createSessionMetadata(
+              Session(
+                id: id,
+                startTime: DateTime.fromMillisecondsSinceEpoch(
+                  timestamp,
+                  isUtc: true,
+                ),
+                status: SessionStatus.active,
+              ),
+            );
+            await leaseQueue.add(_interactionAt(id, timestamp + 1));
+          }
+          final service = createService(eventQueue: leaseQueue);
+
+          // WHEN a flush runs
+          await service.flush();
+
+          // THEN only the event that existed when the flush began is sent;
+          // the one recorded afterward waits for the next flush
+          expect(leaseQueue.commitCount, 1);
+          final remaining = await leaseQueue.fetchOldestHeader(
+            excludeSessionIds: {'contended-session'},
+          );
+          expect(remaining?.timestamp.millisecondsSinceEpoch, 9000);
+        },
+      );
+    });
+
+    group('storage failures', () {
+      test('flush returns a result instead of throwing', () async {
+        // GIVEN a queue whose header reads fail, as IndexedDB does while its
+        // connection is closed
+        final failingQueue = _FailingHeaderQueue();
+        await failingQueue.initialize();
+        final service = createService(eventQueue: failingQueue);
+
+        // WHEN / THEN the failure is logged, not thrown to the caller
+        await expectLater(service.flush(), completes);
+
+        // AND the flush mutex is released so the next flush can run
+        await expectLater(service.flush(), completes);
+      });
+
+      test('flushOneBatch swallows a failing progress read', () async {
+        // GIVEN a healthy upload whose falling-behind header read fails. The
+        // first oldest-header read (batch selection) succeeds; the second,
+        // outside _uploadBatch, throws.
+        final failingQueue = _FailingHeaderQueue(failAfterFetches: 1);
+        await failingQueue.initialize();
+        final session = Session(
+          id: testSessionId,
+          startTime: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+          status: SessionStatus.active,
+        );
+        await failingQueue.createSessionMetadata(session);
+        await failingQueue.add(
+          SessionReplayEvent(
+            sessionId: testSessionId,
+            distinctId: testDistinctId,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(2000, isUtc: true),
+            type: EventType.interaction,
+            payload: InteractionPayload(interactionType: 7, x: 1, y: 2),
+          ),
+        );
+        final service = createService(eventQueue: failingQueue);
+
+        // WHEN / THEN
+        await expectLater(service.flushOneBatch(), completes);
+        await expectLater(service.flushOneBatch(), completes);
+      });
+
+      test(
+        'should not back off uploads when the queue could not be read',
+        () async {
+          // GIVEN a queue whose reads fail transiently, then recover
+          final queue = _ToggleFailingQueue()..failing = true;
+          await queue.initialize();
+          await queue.createSessionMetadata(
+            Session(
+              id: testSessionId,
+              startTime: DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+              status: SessionStatus.active,
+            ),
+          );
+          await queue.add(_interactionAt(testSessionId, 2000));
+          var uploads = 0;
+          final service = createService(
+            eventQueue: queue,
+            httpClient: http_testing.MockClient((request) async {
+              uploads++;
+              return http.Response('', 200);
+            }),
+          );
+
+          // WHEN several periodic uploads hit the storage error, enough to
+          // trigger backoff had they been network failures
+          for (var i = 0; i < 3; i++) {
+            await service.flushOneBatch();
+          }
+          queue.failing = false;
+          await service.flushOneBatch();
+
+          // THEN the next attempt uploads at once: no request was ever sent,
+          // so there was nothing to back off from
+          expect(uploads, 1);
+        },
+      );
+
+      test(
+        'should keep its cutoff when a flush waits for a periodic upload',
+        () async {
+          // GIVEN a periodic upload whose request is in flight
+          final requestedAt = DateTime.utc(2026, 1, 1, 12);
+          await seedQueue(eventCount: 2);
+          final release = Completer<void>();
+          var uploads = 0;
+          final service = createService(
+            eventQueue: eventQueue,
+            maxEventsPerBatch: 1,
+            // Old seeded events would otherwise trigger periodic catch-up
+            // uploads, which are not what this test measures.
+            flushInterval: const Duration(days: 36500),
+            httpClient: http_testing.MockClient((request) async {
+              uploads++;
+              if (uploads == 1) await release.future;
+              return http.Response('', 200);
+            }),
+          );
+          final periodic = service.flushOneBatch();
+          await pumpEventQueue();
+
+          // WHEN a flush is requested, and recording adds an event while it
+          // waits
+          final flushing = withClock(
+            Clock.fixed(requestedAt),
+            () => service.flush(),
+          );
+          await eventQueue.add(
+            SessionReplayEvent(
+              sessionId: testSessionId,
+              distinctId: testDistinctId,
+              timestamp: requestedAt.add(const Duration(seconds: 1)),
+              type: EventType.interaction,
+              payload: InteractionPayload(interactionType: 7, x: 1, y: 2),
+            ),
+          );
+          release.complete();
+          await periodic;
+          await flushing;
+
+          // THEN the flush drains only what existed when it was requested
+          expect(uploads, 2);
+          final remaining = await eventQueue.fetchOldestHeader();
+          expect(
+            remaining?.timestamp,
+            requestedAt.add(const Duration(seconds: 1)),
+          );
+        },
+      );
+
+      test(
+        'should upload an already-queued event when the clock has moved back',
+        () async {
+          // GIVEN a queued event stamped after the wall clock, as after a
+          // clock rollback during a gesture, and a periodic upload in flight
+          final now = DateTime.utc(2026, 1, 1, 12);
+          await seedQueue(eventCount: 1);
+          await eventQueue.add(
+            SessionReplayEvent(
+              sessionId: testSessionId,
+              distinctId: testDistinctId,
+              timestamp: now.add(const Duration(seconds: 10)),
+              type: EventType.interaction,
+              payload: InteractionPayload(interactionType: 7, x: 1, y: 2),
+            ),
+          );
+          final release = Completer<void>();
+          var uploads = 0;
+          final service = createService(
+            eventQueue: eventQueue,
+            maxEventsPerBatch: 1,
+            flushInterval: const Duration(days: 36500),
+            httpClient: http_testing.MockClient((request) async {
+              uploads++;
+              if (uploads == 1) await release.future;
+              return http.Response('', 200);
+            }),
+          );
+          final periodic = service.flushOneBatch();
+          await pumpEventQueue();
+
+          // WHEN a flush is requested meanwhile
+          final flushing = withClock(Clock.fixed(now), () => service.flush());
+          release.complete();
+          await periodic;
+          await flushing;
+
+          // THEN the event queued before the request is uploaded too
+          expect(uploads, 2);
+          expect(await eventQueue.fetchOldestHeader(), isNull);
+        },
+      );
+
+      test(
+        'should run a full flush when called during a periodic upload',
+        () async {
+          // GIVEN a periodic single-batch upload whose request is in flight,
+          // with more events queued behind it
+          await seedQueue(eventCount: 3);
+          final release = Completer<void>();
+          var uploads = 0;
+          final service = createService(
+            eventQueue: eventQueue,
+            maxEventsPerBatch: 1,
+            httpClient: http_testing.MockClient((request) async {
+              uploads++;
+              if (uploads == 1) await release.future;
+              return http.Response('', 200);
+            }),
+          );
+          final periodic = service.flushOneBatch();
+          await pumpEventQueue();
+
+          // WHEN a full flush is requested meanwhile, as on page hide
+          final flushing = service.flush();
+          release.complete();
+          await periodic;
+          await flushing;
+
+          // THEN the flush waited for the periodic upload and then drained
+          // the rest of the queue instead of returning at once
+          expect(uploads, 3);
+          expect(await eventQueue.fetchOldestHeader(), isNull);
+        },
+      );
+    });
+
+    group('dispose', () {
+      test('stops auto flush timer', () async {
+        // GIVEN
+        await seedQueue();
+        final recorder = createRecordingHttpClient(statusCode: 200);
+        final service = createService(
+          eventQueue: eventQueue,
+          flushInterval: Duration(seconds: 1),
+          httpClient: recorder.client,
+        );
+
+        // WHEN - start, dispose, then elapse past the interval
+        fakeAsync((async) {
+          service.startAutoFlush();
+          service.dispose();
+          async.elapse(Duration(seconds: 2));
+          async.flushMicrotasks();
+        });
+
+        // THEN - no HTTP requests were made (timer was cancelled before it fired)
+        expect(recorder.requests.length, 0);
+      });
+
+      test('is safe to call multiple times', () {
+        // GIVEN
+        final service = createService(eventQueue: eventQueue);
+
+        // WHEN / THEN - should not throw
+        service.dispose();
+        service.dispose();
+      });
+    });
+  });
+}
+
+/// Decompress a gzip-compressed request body and return the JSON event list.
+List<dynamic> decodeRequestEvents(http.Request request) {
+  final decompressed = gzip.decode(request.bodyBytes);
+  return jsonDecode(utf8.decode(decompressed)) as List<dynamic>;
+}
+
+/// Queue whose header reads fail the way IndexedDB does while its connection
+/// is closed. [failAfterFetches] oldest-header reads succeed first.
+class _FailingHeaderQueue extends InMemoryEventQueue {
+  _FailingHeaderQueue({this.failAfterFetches = 0});
+
+  final int failAfterFetches;
+  int _oldestHeaderFetches = 0;
+
+  @override
+  Future<QueuedEventHeader?> fetchNewestHeader() async {
+    throw StateError('IndexedDB connection is closed');
+  }
+
+  @override
+  Future<QueuedEventHeader?> fetchOldestHeader({
+    Set<String> excludeSessionIds = const {},
+  }) {
+    if (_oldestHeaderFetches++ >= failAfterFetches) {
+      throw StateError('IndexedDB connection is closed');
+    }
+    return super.fetchOldestHeader(excludeSessionIds: excludeSessionIds);
+  }
+}
+
+SessionReplayEvent _interactionAt(String sessionId, int timestampMs) =>
+    SessionReplayEvent(
+      sessionId: sessionId,
+      distinctId: 'user-1',
+      timestamp: DateTime.fromMillisecondsSinceEpoch(timestampMs, isUtc: true),
+      type: EventType.interaction,
+      payload: InteractionPayload(interactionType: 7, x: 1, y: 2),
+    );
+
+/// Lease queue whose own session records a new event each time a batch is
+/// committed, as a replay that keeps recording during a flush does. Bounded
+/// so a flush that ignores its cutoff fails the test instead of hanging it.
+class _RecordingDuringCommitQueue extends LeaseEventQueue {
+  var _recorded = 0;
+
+  @override
+  Future<void> commitUploadedBatch({
+    required List<PersistedSessionReplayEvent> events,
+    required String sessionId,
+    required int sequenceNumber,
+  }) async {
+    await super.commitUploadedBatch(
+      events: events,
+      sessionId: sessionId,
+      sequenceNumber: sequenceNumber,
+    );
+    if (_recorded++ < 3) {
+      await add(_interactionAt('own-session', 9000 + _recorded - 1));
+    }
+  }
+}
+
+/// In-memory queue whose reads fail while [failing] is set, as IndexedDB's
+/// do while its connection is being reopened.
+class _ToggleFailingQueue extends InMemoryEventQueue {
+  bool failing = false;
+
+  @override
+  Future<QueuedEventHeader?> fetchOldestHeader({
+    Set<String> excludeSessionIds = const {},
+  }) {
+    if (failing) throw StateError('IndexedDB connection is closed');
+    return super.fetchOldestHeader(excludeSessionIds: excludeSessionIds);
+  }
+}
