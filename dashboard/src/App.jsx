@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import RRWebPlayer from "rrweb-player";
 import "rrweb-player/dist/style.css";
 
@@ -199,7 +199,7 @@ function SessionRow({ session, selected, onClick }) {
 
 // ── Session Replay Player ────────────────────────────────────────────────────
 
-function SessionReplay({ sessionId }) {
+function SessionReplay({ sessionId, onLoaded, playerApiRef, onTime }) {
   const wrapperRef = useRef(null); // always visible, safe to measure for width
   const containerRef = useRef(null); // hidden until ready, clientWidth would read 0
   const playerRef = useRef(null);
@@ -219,15 +219,19 @@ function SessionReplay({ sessionId }) {
         const res = await fetch(`${API}/api/v1/sessions/${sessionId}/replay?masked=${masked}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const events = (data.batches || [])
+        const all = (data.batches || [])
           .flatMap(b => b.events || [])
+          .sort((a, b) => a.timestamp - b.timestamp);
+        // Behaviour / console / network tabs read the SDK's metadata events
+        // (and Meta events for navigation) before they're stripped below.
+        if (!cancelled) onLoaded?.(all);
+        const events = all
           // type 5 (Custom) events are the SDK's synthetic network/console/
           // behavior metadata for AI analysis, not real rrweb DOM events.
           // rrweb-player expects Custom events to carry { tag, payload } in
           // `data` and crashes (reading data.tag off undefined) on ones that
           // don't - filter them out, they were never meant to be replayed.
-          .filter(e => e.type !== 5)
-          .sort((a, b) => a.timestamp - b.timestamp);
+          .filter(e => e.type !== 5);
 
         if (cancelled) return;
 
@@ -245,6 +249,14 @@ function SessionReplay({ sessionId }) {
           target: containerRef.current,
           props: { events, width: wrapperRef.current.clientWidth, height: 480, autoPlay: false },
         });
+        const player = playerRef.current;
+        player.addEventListener?.("ui-update-current-time", e => onTime?.(e.payload));
+        if (playerApiRef) {
+          playerApiRef.current = {
+            // offset is ms from the player's first event
+            seek: offset => player.goto(Math.max(0, offset), false),
+          };
+        }
         setStatus("ready");
       } catch (e) {
         if (!cancelled) {
@@ -259,6 +271,7 @@ function SessionReplay({ sessionId }) {
       cancelled = true;
       playerRef.current?.$destroy?.();
       playerRef.current = null;
+      if (playerApiRef) playerApiRef.current = null;
       if (containerRef.current) containerRef.current.innerHTML = "";
     };
   }, [sessionId, masked]);
@@ -316,10 +329,185 @@ function SessionReplay({ sessionId }) {
   );
 }
 
+// ── Behaviour / Console / Network ─────────────────────────────────────────────
+
+function clock(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// Splits the session's raw events into the three activity lists. Offsets are
+// relative to the first replayable (non-Custom) event, which is what
+// rrweb-player's timeline starts at, so a row's time matches the scrubber.
+function buildActivity(events) {
+  const start = events.find(e => e.type !== 5)?.timestamp ?? events[0]?.timestamp ?? 0;
+  const behaviour = [], consoleLogs = [], network = [];
+  let lastHref = null;
+  for (const e of events) {
+    const at = e.timestamp - start;
+    if (e.type === 4 && e.data?.href && e.data.href !== lastHref) {
+      lastHref = e.data.href;
+      behaviour.push({ at, kind: "navigate", label: "Navigate", detail: e.data.href });
+      continue;
+    }
+    if (e.type !== 5) continue;
+    switch (e.subtype) {
+      case "click":
+        behaviour.push({ at, kind: "click", label: "Click", detail: e.selector });
+        break;
+      case "rage_click":
+        behaviour.push({ at, kind: "rage_click", label: "Rage click", detail: e.selector, strong: true });
+        break;
+      case "input":
+        behaviour.push({ at, kind: "input", label: "Input", detail: e.selector });
+        break;
+      case "console":
+        consoleLogs.push({ at, level: e.level || "log", message: e.message });
+        break;
+      case "js_error":
+        consoleLogs.push({ at, level: "exception", message: e.message });
+        break;
+      case "network":
+        network.push({ at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration });
+        break;
+    }
+  }
+  // Inputs fire per keystroke; collapse a run on the same field into one row.
+  const merged = [];
+  for (const b of behaviour) {
+    const prev = merged[merged.length - 1];
+    if (b.kind === "input" && prev?.kind === "input" && prev.detail === b.detail) {
+      prev.count = (prev.count || 1) + 1;
+      continue;
+    }
+    merged.push({ ...b });
+  }
+  return { behaviour: merged, console: consoleLogs, network };
+}
+
+const ACTIVITY_TABS = [
+  { key: "behaviour", label: "Behaviour" },
+  { key: "console", label: "Console" },
+  { key: "network", label: "Network" },
+];
+
+function ActivityPanel({ events, currentTime, onSeek }) {
+  const [tab, setTab] = useState("behaviour");
+  const [errorsOnly, setErrorsOnly] = useState(false);
+  const activity = useMemo(() => buildActivity(events || []), [events]);
+
+  const errorCount = {
+    behaviour: activity.behaviour.filter(b => b.kind === "rage_click").length,
+    console: activity.console.filter(c => c.level === "error" || c.level === "exception").length,
+    network: activity.network.filter(n => !n.status || n.status >= 400).length,
+  };
+
+  let rows = activity[tab];
+  if (errorsOnly) {
+    rows = rows.filter(r =>
+      tab === "behaviour" ? r.kind === "rage_click"
+      : tab === "console" ? r.level === "error" || r.level === "exception"
+      : !r.status || r.status >= 400);
+  }
+  // Last row at or before the playhead, highlighted as "now".
+  let activeIdx = -1;
+  if (typeof currentTime === "number") {
+    rows.forEach((r, i) => { if (r.at <= currentTime) activeIdx = i; });
+  }
+
+  const cell = { padding: "7px 10px", fontSize: 12, verticalAlign: "top" };
+  const mono = { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" };
+
+  return (
+    <div style={{ marginTop: 16, border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: `1px solid ${C.border}`, background: C.bgSubtle, padding: "0 8px" }}>
+        <div style={{ display: "flex" }}>
+          {ACTIVITY_TABS.map(t => {
+            const active = tab === t.key;
+            return (
+              <button key={t.key} onClick={() => setTab(t.key)} style={{
+                padding: "10px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                background: "transparent", border: "none",
+                borderBottom: `2px solid ${active ? C.ink : "transparent"}`,
+                color: active ? C.text : C.textMuted, marginBottom: -1,
+              }}>
+                {t.label}
+                <span style={{ marginLeft: 6, fontSize: 10, color: C.textFaint }}>{activity[t.key].length}</span>
+                {errorCount[t.key] > 0 && (
+                  <span style={{ marginLeft: 4, fontSize: 10, fontWeight: 700, padding: "0 5px", borderRadius: 8, background: C.ink, color: "#fff" }}>
+                    {errorCount[t.key]}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        <label style={{ fontSize: 11, color: C.textMuted, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+          <input type="checkbox" checked={errorsOnly} onChange={e => setErrorsOnly(e.target.checked)} />
+          {tab === "behaviour" ? "Frustration only" : "Errors only"}
+        </label>
+      </div>
+
+      <div style={{ maxHeight: 320, overflowY: "auto" }}>
+        {events === null ? (
+          <div style={{ padding: 20, fontSize: 12, color: C.textMuted, textAlign: "center" }}>Loading activity…</div>
+        ) : rows.length === 0 ? (
+          <div style={{ padding: 20, fontSize: 12, color: C.textFaint, textAlign: "center" }}>
+            {errorsOnly ? "Nothing matches this filter." : {
+              behaviour: "No clicks, inputs or navigation captured.",
+              console: "No console warnings or errors captured.",
+              network: "No network requests captured (the mobile SDK does not record them yet).",
+            }[tab]}
+          </div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+            <tbody>
+              {rows.map((r, i) => {
+                const isError = tab === "console" ? (r.level === "error" || r.level === "exception")
+                  : tab === "network" ? (!r.status || r.status >= 400)
+                  : r.strong;
+                return (
+                  <tr key={i} onClick={() => onSeek?.(r.at)} title="Jump to this moment in the replay" style={{
+                    cursor: "pointer", borderBottom: `1px solid ${C.border}`,
+                    background: i === activeIdx ? C.bgHover : "transparent",
+                    boxShadow: isError ? `inset 3px 0 0 ${C.ink}` : "none",
+                  }}>
+                    <td style={{ ...cell, ...mono, width: 56, color: C.textFaint }}>{clock(r.at)}</td>
+                    {tab === "behaviour" && <>
+                      <td style={{ ...cell, width: 96, fontWeight: r.strong ? 700 : 600, color: C.text }}>{r.label}</td>
+                      <td style={{ ...cell, ...mono, color: C.textMuted, wordBreak: "break-all" }}>
+                        {r.detail || "—"}{r.count > 1 && <span style={{ color: C.textFaint }}> ×{r.count}</span>}
+                      </td>
+                    </>}
+                    {tab === "console" && <>
+                      <td style={{ ...cell, width: 80, fontWeight: isError ? 700 : 600, color: isError ? C.text : C.textMuted, textTransform: "uppercase", fontSize: 10, letterSpacing: "0.04em" }}>{r.level}</td>
+                      <td style={{ ...cell, ...mono, color: C.text, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{r.message}</td>
+                    </>}
+                    {tab === "network" && <>
+                      <td style={{ ...cell, ...mono, width: 60, fontWeight: 600, color: C.text }}>{r.method}</td>
+                      <td title={r.url} style={{ ...cell, ...mono, color: C.textMuted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.url}</td>
+                      <td style={{ ...cell, ...mono, width: 60, textAlign: "right", fontWeight: isError ? 700 : 500, color: isError ? C.text : C.textMuted }}>{r.status || "failed"}</td>
+                      <td style={{ ...cell, ...mono, width: 70, textAlign: "right", color: C.textFaint }}>{r.duration == null ? "—" : r.duration === 0 ? "0ms" : dur(r.duration)}</td>
+                    </>}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Session Detail ────────────────────────────────────────────────────────────
 
 function SessionDetail({ session, onAnalyze, onCreateJira }) {
   const [loading, setLoading] = useState(false);
+  const [replayEvents, setReplayEvents] = useState(null);
+  const [currentTime, setCurrentTime] = useState(null);
+  const playerApiRef = useRef(null);
+  useEffect(() => { setReplayEvents(null); setCurrentTime(null); }, [session.session_id]);
   const analyzed = session.ai_status === "complete" && session.ai_summary;
 
   const handleAnalyze = async () => {
@@ -427,7 +615,17 @@ function SessionDetail({ session, onAnalyze, onCreateJira }) {
       {/* Session Replay */}
       <div>
         <SectionHeader>Session Replay</SectionHeader>
-        <SessionReplay sessionId={session.session_id} />
+        <SessionReplay
+          sessionId={session.session_id}
+          onLoaded={setReplayEvents}
+          onTime={setCurrentTime}
+          playerApiRef={playerApiRef}
+        />
+        <ActivityPanel
+          events={replayEvents}
+          currentTime={currentTime}
+          onSeek={at => playerApiRef.current?.seek(at)}
+        />
       </div>
     </div>
   );
