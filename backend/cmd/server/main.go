@@ -43,14 +43,13 @@ func main() {
 	}
 
 	// ─── Retention ───────────────────────────────────────────────────────────
-	if cfg.SessionRetentionDays > 0 {
-		n, err := db.PurgeOldSessions(context.Background(), cfg.SessionRetentionDays)
-		if err != nil {
-			slog.Error("session retention purge failed", "error", err)
-		} else if n > 0 {
-			slog.Info("purged old sessions", "count", n, "retention_days", cfg.SessionRetentionDays)
-		}
+	// Deletes expired sessions (stored events and rows) now and hourly.
+	retention, err := pipeline.ParseRetention(cfg.SessionRetentionDays, os.Getenv("SESSION_RETENTION_DAYS_BY_PROJECT"))
+	if err != nil {
+		slog.Error("invalid retention config", "error", err)
+		os.Exit(1)
 	}
+	go pipeline.RunRetention(context.Background(), pipeline.StorageRetention{DB: db, MinIO: minio}, retention, time.Hour)
 
 	// ─── AI Engine ───────────────────────────────────────────────────────────
 	aiEngine := ai.NewOllamaEngine(cfg.OllamaEndpoint, cfg.OllamaModel, cfg.EmbeddingModel).

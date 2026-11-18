@@ -110,7 +110,8 @@ adapter's `POST /riq/events` (same token auth as `/record`), which adds it to th
 | Hook | Records |
 |---|---|
 | `navigatorObservers: [companion.navigatorObserver]` | screen changes as `app://flutter/<route name>` |
-| `companion.httpClient()` | method, URL, status, duration; status 0 plus the error when there is no response |
+| `companion.captureAllHttp()` | every request made through dart:io's `HttpClient` (package:http, Dio, `Image.network`): method, URL, status, duration; status 0 plus the error when there is no response. The recorders' own uploads to the adapter are skipped |
+| `companion.httpClient()` | the same, for chosen calls only (when not using `captureAllHttp`) |
 | `companion.installErrorHandlers()` | `FlutterError.onError` and uncaught async errors, with stack and first app frame |
 | `companion.runCapturingPrints(() => runApp(...))` | `print`/`debugPrint` lines (skips the SDK's own logs and Flutter's printed error reports) |
 
@@ -130,9 +131,9 @@ these fields on ingest (`masking.MaskTextFields`).
 
 ## Known limits of this POC
 
-- **Companion coverage:** only requests made through `companion.httpClient()` are recorded (not
-  other `HttpClient`s or plugins' native networking), and navigation only for named routes reads
-  well (unnamed ones show as `app://flutter/`).
+- **Companion coverage:** requests made by plugins' native code (iOS/Android networking, not
+  Dart) aren't recorded, and navigation only for named routes reads well (unnamed ones show as
+  `app://flutter/`).
 - **Privacy:** pixels are masked on the device; ReplayIQ's server-side masking cannot redact
   pixels, and the raw bucket stores batches unmasked. Default SDK masking hides all text, which
   also blanks the wireframe labels; the demo unmasks text to make the AI output readable. Decide

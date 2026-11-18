@@ -133,6 +133,18 @@ func main() {
 		})
 	}()
 
+	// Retention — deletes expired sessions (stored events and rows) hourly.
+	retention, err := pipeline.ParseRetention(getEnvInt("SESSION_RETENTION_DAYS", 0), getEnv("SESSION_RETENTION_DAYS_BY_PROJECT", ""))
+	if err != nil {
+		slog.Error("invalid retention config", "error", err)
+		os.Exit(1)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pipeline.RunRetention(ctx, pipeline.StorageRetention{DB: db, MinIO: minio}, retention, time.Hour)
+	}()
+
 	slog.Info("processor ready — waiting for messages")
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

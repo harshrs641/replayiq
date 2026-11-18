@@ -17,6 +17,14 @@ type gzipWriter struct {
 
 func (g *gzipWriter) Write(b []byte) (int, error) { return g.zw.Write(b) }
 
+// Flush sends what is compressed so far (streamed responses).
+func (g *gzipWriter) Flush() {
+	g.zw.Flush()
+	http.NewResponseController(g.ResponseWriter).Flush()
+}
+
+func (g *gzipWriter) Unwrap() http.ResponseWriter { return g.ResponseWriter }
+
 func (g *gzipWriter) WriteHeader(code int) {
 	g.Header().Del("Content-Length")
 	g.ResponseWriter.WriteHeader(code)

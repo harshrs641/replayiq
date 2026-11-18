@@ -219,9 +219,8 @@ function SessionRow({ session, selected, onClick }) {
 
 const CHUNK_MS = 20000;
 const AHEAD_MS = 15000;
-// Live sessions: how often to check for new events, and how close to the
-// newest event the playhead must be to count as watching live.
-const LIVE_POLL_MS = 3000;
+// Live sessions: how close to the newest event the playhead must be to
+// count as watching live. New events are pushed by .../replay/live.
 const LIVE_EDGE_MS = 4000;
 // Empty tag + transparent colour: rrweb-player draws a marker for every
 // custom event, and this one only exists to stretch the timeline.
@@ -323,7 +322,10 @@ class ReplayStreamer {
     // End marker: makes the scrubber span the whole session from the start.
     insertSorted(this.events, [{ type: 5, timestamp: m.end, data: { tag: END_MARKER_TAG, payload: {} } }]);
     // rrweb-player places markers once, as a % of the timeline at creation;
-    // on a live session that keeps growing they would drift, so skip them.
+    // on a live session that keeps growing they would drift. Live sessions
+    // get them on our own bar instead (ownMarkers), updated as events arrive.
+    this.ownMarkers = !!m.live;
+    this.liveMarkers = m.live ? buildMarkers(activity, m.start) : [];
     this.markers = m.live ? [] : buildMarkers(activity, m.start).filter(k => k.ts >= this.zero && k.ts <= m.end);
     this.tags = { [END_MARKER_TAG]: "transparent" };
     for (const k of this.markers) this.tags[k.tag] = MARKER_COLORS[k.kind];
@@ -332,7 +334,7 @@ class ReplayStreamer {
     this.createPlayer(0, false);
     if (m.live) {
       // Like a live stream: open at the newest moment and keep following.
-      this.liveTimer = setInterval(() => this.pollLive(), LIVE_POLL_MS);
+      this.openLive();
       this.goLive();
     }
     return { manifest: m, activity };
@@ -348,42 +350,54 @@ class ReplayStreamer {
     this.seekAbs(this.manifest.end - 2000, true);
   }
 
-  async pollLive() {
-    if (this.polling || this.destroyed) return;
-    this.polling = true;
-    try {
-      const base = `${API}/api/v1/sessions/${this.sessionId}/replay`;
-      const [m, activity] = await Promise.all([
-        fetch(`${base}/manifest?masked=${this.masked}`).then(r => (r.ok ? r.json() : null)),
-        fetch(`${base}/activity?masked=${this.masked}`).then(r => (r.ok ? r.json() : null)).catch(() => null),
-      ]);
-      if (this.destroyed || !m) return;
-      if (activity) this.onActivity?.((activity.events || []).sort((a, b) => a.timestamp - b.timestamp));
-      const oldEnd = this.manifest.end;
-      const following = this.atLiveEdge();
-      // rrweb's playback timer stops once it runs out of events, while the
-      // player still reports "playing" (and doesn't always fire "finish"):
-      // a playhead that hasn't moved since the last poll has stalled there.
-      const stalled = this.finished || this.now === this.lastPollNow;
-      this.lastPollNow = this.now;
-      this.manifest = m;
-      if (m.end > oldEnd && following && !this.loading) {
-        // Fetch the new tail now (not when the playhead nears it): at the
-        // live edge, the player has nothing left to play.
-        const r = this.ranges.find(([a, b]) => a <= oldEnd && oldEnd < b);
-        if (r) {
-          await this.loadForward(r);
-          // Stopped at the old end: carry on from there with the new events.
-          if (stalled && !this.destroyed) this.player.goto(this.now - this.zero, true);
-        }
-      }
-      if (!m.live) clearInterval(this.liveTimer);
-      this.emit();
-    } catch (err) {
-      console.error("live poll failed", err);
-    } finally {
-      this.polling = false;
+  // The server pushes each new manifest with the events stored since the
+  // last one (server-sent events; EventSource reconnects by itself and
+  // resumes from the last update's id).
+  openLive() {
+    const q = new URLSearchParams({ masked: String(this.masked), after: String(this.manifest.end) });
+    const es = (this.live = new EventSource(`${API}/api/v1/sessions/${this.sessionId}/replay/live?${q}`));
+    es.addEventListener("update", e => {
+      try { this.onLiveUpdate(JSON.parse(e.data)); }
+      catch (err) { console.error("live update failed", err); }
+    });
+    es.addEventListener("end", () => { es.close(); this.emit(); });
+  }
+
+  onLiveUpdate({ manifest: m, events }) {
+    if (this.destroyed) return;
+    events = (events || []).sort((a, b) => a.timestamp - b.timestamp);
+    const oldEnd = this.manifest.end;
+    const following = this.atLiveEdge();
+    // rrweb's playback timer stops once it runs out of events, while the
+    // player still reports "playing" (and doesn't always fire "finish"):
+    // a playhead that hasn't moved since the last update has stalled there.
+    const stalled = this.finished || this.now === this.lastUpdateNow;
+    this.lastUpdateNow = this.now;
+    this.manifest = m;
+
+    // Activity tabs: navigation and SDK-tagged events.
+    const act = events.filter(e => e.type === 4 || (e.type === 5 && e.subtype));
+    if (act.length) {
+      this.activity = [...(this.activity || []), ...act].sort((a, b) => a.timestamp - b.timestamp);
+      this.onActivity?.(this.activity);
+      this.liveMarkers = buildMarkers(this.activity, m.start);
     }
+
+    // Extend the range that reaches the old end; ranges elsewhere load the
+    // usual way when the playhead gets there.
+    const r = this.ranges.find(([a, b]) => a <= oldEnd && oldEnd < b);
+    if (r && m.end >= r[1]) {
+      const from = r[1];
+      const add = events.filter(e => playable(e) && e.timestamp >= from);
+      this.loadedEvents += add.length;
+      add.forEach(e => this.player.addEvent(e));
+      insertSorted(this.events, add);
+      this.addRange(from, m.end + 1);
+      // Stopped at the old end: carry on from there with the new events.
+      if (following && stalled && add.length) this.player.goto(this.now - this.zero, true);
+    }
+    if (!m.live) this.live?.close();
+    this.emit();
   }
 
   createPlayer(offset, play) {
@@ -450,6 +464,7 @@ class ReplayStreamer {
       buffering: this.buffering,
       failed: this.failed,
       loadedEvents: this.loadedEvents,
+      markers: this.ownMarkers ? this.liveMarkers : null,
     });
   }
 
@@ -543,7 +558,7 @@ class ReplayStreamer {
   destroy() {
     this.destroyed = true;
     clearTimeout(this.failTimer);
-    clearInterval(this.liveTimer);
+    this.live?.close();
     this.player?.$destroy?.();
     this.player = null;
     this.listeners.clear();
@@ -613,6 +628,8 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest, onActivity
   // latest end.
   const end = stream.end ?? manifest?.end;
   const span = manifest ? Math.max(1, end - manifest.start) : 1;
+  // Live sessions draw markers on the bar below (see ReplayStreamer.start).
+  const counts = stream.markers ? countBy(stream.markers, k => k.kind) : markerCounts;
 
   return (
     <div ref={wrapperRef} style={{ position: "relative" }}>
@@ -714,6 +731,24 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest, onActivity
               }} />
             ))}
           </div>
+          {stream.markers?.length > 0 && (
+            // Problems so far, on a timeline that grows with the session.
+            <div style={{ position: "relative", height: 12, marginTop: 3 }}>
+              {stream.markers.map((k, i) => (
+                <button
+                  key={i}
+                  onClick={() => streamerRef.current?.seekAbs(k.ts)}
+                  title={k.tag}
+                  aria-label={k.tag}
+                  style={{
+                    position: "absolute", top: 0, height: 12, width: 3, padding: 0, border: 0, borderRadius: 1,
+                    cursor: "pointer", background: MARKER_COLORS[k.kind],
+                    left: `calc(${Math.min(100, ((k.ts - manifest.start) / span) * 100)}% - 1px)`,
+                  }}
+                />
+              ))}
+            </div>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginTop: 4, fontSize: 10, color: C.textFaint }}>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
               {stream.live && (
@@ -735,14 +770,15 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest, onActivity
               )}
               Streaming · {stream.loadedEvents} events loaded · {manifest.keyframes.length} keyframe{manifest.keyframes.length === 1 ? "" : "s"}
             </span>
-            {/* Legend for the ticks rrweb-player draws on its scrubber. */}
+            {/* Legend for the marker ticks (rrweb-player's scrubber, or the
+                bar above for live sessions). */}
             <span style={{ display: "flex", gap: 10 }}>
               {[["error", "errors"], ["network", "failed requests"], ["rage", "rage clicks"]]
-                .filter(([k]) => markerCounts[k])
+                .filter(([k]) => counts[k])
                 .map(([k, label]) => (
                   <span key={k} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
                     <span style={{ width: 3, height: 9, borderRadius: 1, background: MARKER_COLORS[k] }} />
-                    {markerCounts[k]} {label}
+                    {counts[k]} {label}
                   </span>
                 ))}
             </span>

@@ -80,13 +80,28 @@ func TokenTimeMs(t string) int64 {
 }
 
 // resolve turns a citation into a timestamp, falling back to GroundText.
-func resolve(ref int, cited []models.TokenizedEvent, text string, all []models.TokenizedEvent) int64 {
+// Where a finding's time came from.
+const (
+	MomentAI      = "ai"      // the model cited the event
+	MomentMatched = "matched" // found by matching the text (GroundText)
+	MomentNone    = "none"    // looked for, not found
+)
+
+func resolve(ref int, cited []models.TokenizedEvent, text string, all []models.TokenizedEvent) (int64, string) {
 	if ref >= 0 && ref < len(cited) {
 		if ms := TokenTimeMs(cited[ref].T); ms > 0 {
-			return ms
+			return ms, MomentAI
 		}
 	}
-	return GroundText(text, all)
+	return Ground(text, all)
+}
+
+// Ground places a finding by its text alone: GroundText plus the source.
+func Ground(text string, events []models.TokenizedEvent) (int64, string) {
+	if ts := GroundText(text, events); ts > 0 {
+		return ts, MomentMatched
+	}
+	return 0, MomentNone
 }
 
 var quotedRe = regexp.MustCompile(`["'“”‘’]([^"'“”‘’]{2,60})["'“”‘’]`)

@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -91,5 +93,46 @@ func TestReplayCacheControl(t *testing.T) {
 	if replayCacheControl(&models.Session{EndedAt: &old}, "manifest") != "private, max-age=300" ||
 		replayCacheControl(&models.Session{EndedAt: &old}, "events") != "private, max-age=86400" {
 		t.Fatal("finished sessions: short manifest cache, long chunk cache")
+	}
+}
+
+func TestLiveResumePoint(t *testing.T) {
+	req := httptest.NewRequest("GET", "/x?after=1700000000000.5", nil)
+	if n, err := liveResumePoint(req); err != nil || n != 1700000000000 {
+		t.Fatalf("after: %d %v", n, err)
+	}
+	req.Header.Set("Last-Event-ID", "1700000005000")
+	if n, _ := liveResumePoint(req); n != 1700000005000 {
+		t.Fatalf("a reconnect resumes from Last-Event-ID, got %d", n)
+	}
+	if _, err := liveResumePoint(httptest.NewRequest("GET", "/x?after=abc", nil)); err == nil {
+		t.Fatal("bad after must fail")
+	}
+}
+
+func TestLiveMessageIsValidSSE(t *testing.T) {
+	var events bytes.Buffer
+	cw := &compactWriter{w: &events}
+	events.WriteString("[")
+	cw.Write([]byte("{\n  \"type\": 3,\n  \"timestamp\": 5\n}"))
+	cw.Write([]byte(","))
+	cw.Write([]byte(`{"type":2,"timestamp":6}`))
+	events.WriteString("]")
+	var out bytes.Buffer
+	(&liveMessage{manifest: replayManifest{End: 6, Live: true}, events: events.Bytes()}).write(&out)
+	msg := out.String()
+	if !strings.HasPrefix(msg, "id: 6\nevent: update\ndata: {") || !strings.HasSuffix(msg, "}\n\n") {
+		t.Fatalf("%q", msg)
+	}
+	data := strings.TrimSuffix(strings.SplitN(msg, "data: ", 2)[1], "\n\n")
+	if strings.Contains(data, "\n") {
+		t.Fatalf("data must be one line: %q", data)
+	}
+	var parsed struct {
+		Manifest replayManifest    `json:"manifest"`
+		Events   []json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(data), &parsed); err != nil || len(parsed.Events) != 2 || parsed.Manifest.End != 6 {
+		t.Fatalf("%v %+v", err, parsed)
 	}
 }

@@ -155,11 +155,19 @@ Paste this in any browser console to start recording immediately:
   ReplayIQ.init({
     endpoint: 'https://your-replayiq-host',
     projectId: 'your-project-id',
-    sampleRate: 1.0,      // 0.0–1.0, default 1.0
+    sampleRate: 1.0,      // 0.0–1.0, default 1.0; decided once per session
+    pauseWhenHiddenMs: 60000,   // pause recording in a tab hidden this long (0 = never)
+    pauseWhenIdleMs: 600000,    // pause after this long with no input (0 = never)
     debug: false,
   });
 </script>
 ```
+
+The SDK keeps its own cost on the page low:
+- **Sampling is decided once per session,** before anything is downloaded. A session that isn't sampled never loads rrweb and sends nothing, and a sampled one is recorded on every page it visits.
+- **rrweb loads after the page has loaded and the browser is idle.** Network, console and error capture start right away, so nothing from page startup is missed.
+- **Recording pauses** when a tab has been hidden for a minute or nobody has interacted for 10 minutes. It resumes with a fresh snapshot when the user comes back.
+- **Batches are sent whenever the tab is hidden,** because mobile browsers often close tabs without `beforeunload`.
 
 ### Option C — NPM module (coming soon)
 
@@ -228,9 +236,13 @@ All accept `masked=true|false` like `/replay` and are gzip-compressed (about 6x 
 
 Each stored batch carries its time range and keyframes as object metadata, so the manifest is one listing call. Batches stored before that are read once to build their index, cached in memory; run `go run ./cmd/backfill-index` (from `backend/`, with the same `MINIO_*` env) once to write the index into them for good.
 
-**Live sessions:** while a session is still recording (no end signal yet, or ended under 2 minutes ago; a session with no events for 5 minutes stops counting), the manifest says `"live": true`. The player then opens at the newest moment, polls every 3 s and follows new events like a live stream (a **LIVE** / **GO LIVE** button under it).
+**Live sessions:** while a session is still recording (no end signal yet, or ended under 2 minutes ago; a session with no events for 5 minutes stops counting), the manifest says `"live": true`. The player then opens at the newest moment and follows new events like a live stream (a **LIVE** / **GO LIVE** button under it):
+- **How new events arrive:** the player keeps `GET .../replay/live?after=<ms>` open, a server-sent event stream. The server checks storage every second and pushes the new manifest together with the events stored since the last update. Each update's `id` lets a reconnecting `EventSource` resume where it left off. When the session ends, the stream says `end` and closes.
+- **Markers:** errors, failed requests and rage clicks appear on a bar under the player as they arrive, and each one is clickable. rrweb-player positions its own markers only once, when it opens.
 
-**Jump to findings:** `GET /api/v1/sessions/:id/moments` returns when each AI frustration and issue happened. The analysis prompt numbers the events and asks the model to cite the one each finding is about; findings without a usable citation, and sessions analysed before this, are placed by matching their text against the events (`source: "matched"`, shown as "≈"). The dashboard puts a ▶ button on each finding, and the Issues tab has "Watch in replay".
+**Finished sessions** are cached in the query service: where their replay is stored for 5 minutes, and their gzipped chunk and activity responses for an hour, up to 128 MB. Re-watching one costs no storage reads or compression.
+
+**Jump to findings:** `GET /api/v1/sessions/:id/moments` returns when each AI frustration and issue happened. The analysis prompt numbers the events and asks the model to cite the one each finding is about; findings without a usable citation, and sessions analysed before this, are placed by matching their text against the events (`source: "matched"`, shown as "≈"). How each time was found is stored with it, and older sessions are matched the first time they are viewed and saved, so matching runs once per finding. The dashboard puts a ▶ button on each finding, and the Issues tab has "Watch in replay".
 
 **Links:** `http://<dashboard>/?session=<id>&t=<seconds>` opens a session at that moment; "Copy link at this moment" above the player makes one.
 
@@ -303,6 +315,17 @@ Mark elements in HTML:
 ```html
 <input data-riq-mask name="national-id" />
 ```
+
+### Retention
+
+Nothing is deleted by default. Set:
+
+```bash
+SESSION_RETENTION_DAYS=90                          # every project
+SESSION_RETENTION_DAYS_BY_PROJECT=acme=365,demo=7  # overrides; 0 = keep forever
+```
+
+The processor (or the all-in-one server) then deletes expired sessions at startup and every hour. Each session's stored events are deleted first, both the raw and the masked copy, then its row and AI issues. A session whose events fail to delete keeps its row and is retried on the next pass, so no event objects are left without a session.
 
 ---
 

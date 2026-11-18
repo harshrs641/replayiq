@@ -13,6 +13,8 @@
 import 'package:flutter/material.dart';
 import 'package:mixpanel_flutter_session_replay/mixpanel_flutter_session_replay.dart';
 
+import 'package:http/http.dart' as http;
+
 import 'replayiq_companion.dart';
 
 const String riqUrl = String.fromEnvironment('RIQ_URL');
@@ -30,11 +32,10 @@ final companion = ReplayIQCompanion(
   replayId: () => replayInstance?.replayId,
 );
 
-/// Use for the app's API calls so they show in the Network tab.
-final apiClient = companion.httpClient();
-
 void main() {
   companion.installErrorHandlers();
+  // Every HTTP request the app makes shows in the Network tab.
+  companion.captureAllHttp();
   companion.runCapturingPrints(() => runApp(const PocApp()));
 }
 
@@ -147,7 +148,7 @@ class CheckoutScreen extends StatelessWidget {
           // Network tab: this path doesn't exist on the adapter, so it's a 404.
           OutlinedButton(
             onPressed: () async {
-              final res = await apiClient.get(Uri.parse('$riqUrl/demo/prices'));
+              final res = await http.get(Uri.parse('$riqUrl/demo/prices'));
               print('Prices request returned ${res.statusCode}');
             },
             child: const Text('Load prices (fails)'),

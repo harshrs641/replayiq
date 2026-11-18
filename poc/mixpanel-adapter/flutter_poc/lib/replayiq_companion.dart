@@ -11,12 +11,14 @@
 //     adapterUrl: riqUrl, token: riqProject, replayId: () => replay?.replayId);
 //   companion.installErrorHandlers();
 //   MaterialApp(navigatorObservers: [companion.navigatorObserver], ...);
-//   final client = companion.httpClient(); // use for API calls
+//   companion.captureAllHttp(); // every dart:io HTTP request (http, Dio, images)
+//   // or, for chosen calls only: final client = companion.httpClient();
 //
 // Text (log lines, URLs, stack traces) leaves the device unmasked; ReplayIQ
 // redacts PII patterns in these fields on ingest.
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
@@ -102,7 +104,40 @@ class ReplayIQCompanion {
 
   /// An HTTP client that records every request's method, URL, status and
   /// duration (status 0 plus the error when no response arrives).
+  /// Not needed after [captureAllHttp], which already sees these requests.
   http.Client httpClient([http.Client? inner]) => _RecordingClient(inner ?? http.Client(), this);
+
+  /// Records every request made through dart:io's HttpClient: package:http,
+  /// Dio, `Image.network`, and most other HTTP libraries use it. Installs
+  /// an [HttpOverrides] (wrapping any already installed). The recorders' own
+  /// uploads to the adapter (this companion's, the replay SDK's) are skipped.
+  void captureAllHttp() {
+    _capturingAll = true;
+    HttpOverrides.global = _RecordingHttpOverrides(this, HttpOverrides.current);
+  }
+
+  bool _capturingAll = false;
+
+  // The adapter routes the recorders use: replay uploads and settings
+  // (Mixpanel SDK) and /riq/events (this companion).
+  static final _ownPaths = RegExp(r'/(record|settings|riq/events)/?$');
+
+  bool _isOwnTraffic(Uri url) =>
+      url.host == _endpoint.host &&
+      url.port == _endpoint.port &&
+      url.scheme == _endpoint.scheme &&
+      _ownPaths.hasMatch(url.path);
+
+  void _recordRequest(String method, Uri url, Stopwatch watch, {int status = 0, Object? error}) {
+    if (_isOwnTraffic(url)) return;
+    record('network', {
+      'method': method,
+      'url': url.toString(),
+      'status': status,
+      if (error != null) 'error': error.toString(),
+      'duration': watch.elapsedMilliseconds,
+    });
+  }
 
   /// Records Flutter framework errors and uncaught async errors, then hands
   /// them to whatever handlers were installed before.
@@ -266,28 +301,134 @@ class _RecordingClient extends http.BaseClient {
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    // captureAllHttp records it already, at the dart:io level.
+    if (_companion._capturingAll) return _inner.send(request);
     final watch = Stopwatch()..start();
     try {
       final res = await _inner.send(request);
-      _companion.record('network', {
-        'method': request.method,
-        'url': request.url.toString(),
-        'status': res.statusCode,
-        'duration': watch.elapsedMilliseconds,
-      });
+      _companion._recordRequest(request.method, request.url, watch, status: res.statusCode);
       return res;
     } catch (e) {
-      _companion.record('network', {
-        'method': request.method,
-        'url': request.url.toString(),
-        'status': 0,
-        'error': e.toString(),
-        'duration': watch.elapsedMilliseconds,
-      });
+      _companion._recordRequest(request.method, request.url, watch, error: e);
       rethrow;
     }
   }
 
   @override
   void close() => _inner.close();
+}
+
+class _RecordingHttpOverrides extends HttpOverrides {
+  _RecordingHttpOverrides(this._companion, this._previous);
+  final ReplayIQCompanion _companion;
+  final HttpOverrides? _previous;
+
+  @override
+  HttpClient createHttpClient(SecurityContext? context) =>
+      _RecordingHttpClient(_previous?.createHttpClient(context) ?? super.createHttpClient(context), _companion);
+
+  @override
+  String findProxyFromEnvironment(Uri url, Map<String, String>? environment) =>
+      _previous?.findProxyFromEnvironment(url, environment) ?? super.findProxyFromEnvironment(url, environment);
+}
+
+/// Forwards everything to a real HttpClient and records each request once
+/// its response headers arrive (HttpClientRequest.done), or when it fails.
+class _RecordingHttpClient implements HttpClient {
+  _RecordingHttpClient(this._inner, this._companion);
+  final HttpClient _inner;
+  final ReplayIQCompanion _companion;
+
+  Future<HttpClientRequest> _track(String method, Uri url, Future<HttpClientRequest> opening) async {
+    final watch = Stopwatch()..start();
+    final HttpClientRequest req;
+    try {
+      req = await opening;
+    } catch (e) {
+      _companion._recordRequest(method, url, watch, error: e); // e.g. DNS, refused
+      rethrow;
+    }
+    req.done.then(
+      (res) => _companion._recordRequest(req.method, req.uri, watch, status: res.statusCode),
+      onError: (Object e) => _companion._recordRequest(req.method, req.uri, watch, error: e),
+    );
+    return req;
+  }
+
+  Uri _uri(String host, int port, String path) => Uri(scheme: 'http', host: host, port: port, path: path);
+
+  @override
+  Future<HttpClientRequest> openUrl(String method, Uri url) => _track(method, url, _inner.openUrl(method, url));
+  @override
+  Future<HttpClientRequest> open(String method, String host, int port, String path) =>
+      _track(method, _uri(host, port, path), _inner.open(method, host, port, path));
+  @override
+  Future<HttpClientRequest> getUrl(Uri url) => openUrl('GET', url);
+  @override
+  Future<HttpClientRequest> postUrl(Uri url) => openUrl('POST', url);
+  @override
+  Future<HttpClientRequest> putUrl(Uri url) => openUrl('PUT', url);
+  @override
+  Future<HttpClientRequest> deleteUrl(Uri url) => openUrl('DELETE', url);
+  @override
+  Future<HttpClientRequest> patchUrl(Uri url) => openUrl('PATCH', url);
+  @override
+  Future<HttpClientRequest> headUrl(Uri url) => openUrl('HEAD', url);
+  @override
+  Future<HttpClientRequest> get(String host, int port, String path) => open('GET', host, port, path);
+  @override
+  Future<HttpClientRequest> post(String host, int port, String path) => open('POST', host, port, path);
+  @override
+  Future<HttpClientRequest> put(String host, int port, String path) => open('PUT', host, port, path);
+  @override
+  Future<HttpClientRequest> delete(String host, int port, String path) => open('DELETE', host, port, path);
+  @override
+  Future<HttpClientRequest> patch(String host, int port, String path) => open('PATCH', host, port, path);
+  @override
+  Future<HttpClientRequest> head(String host, int port, String path) => open('HEAD', host, port, path);
+
+  @override
+  Duration get idleTimeout => _inner.idleTimeout;
+  @override
+  set idleTimeout(Duration v) => _inner.idleTimeout = v;
+  @override
+  Duration? get connectionTimeout => _inner.connectionTimeout;
+  @override
+  set connectionTimeout(Duration? v) => _inner.connectionTimeout = v;
+  @override
+  int? get maxConnectionsPerHost => _inner.maxConnectionsPerHost;
+  @override
+  set maxConnectionsPerHost(int? v) => _inner.maxConnectionsPerHost = v;
+  @override
+  bool get autoUncompress => _inner.autoUncompress;
+  @override
+  set autoUncompress(bool v) => _inner.autoUncompress = v;
+  @override
+  String? get userAgent => _inner.userAgent;
+  @override
+  set userAgent(String? v) => _inner.userAgent = v;
+
+  @override
+  set authenticate(Future<bool> Function(Uri url, String scheme, String? realm)? f) => _inner.authenticate = f;
+  @override
+  void addCredentials(Uri url, String realm, HttpClientCredentials credentials) =>
+      _inner.addCredentials(url, realm, credentials);
+  @override
+  set connectionFactory(Future<ConnectionTask<Socket>> Function(Uri url, String? proxyHost, int? proxyPort)? f) =>
+      _inner.connectionFactory = f;
+  @override
+  set findProxy(String Function(Uri url)? f) => _inner.findProxy = f;
+  @override
+  set authenticateProxy(Future<bool> Function(String host, int port, String scheme, String? realm)? f) =>
+      _inner.authenticateProxy = f;
+  @override
+  void addProxyCredentials(String host, int port, String realm, HttpClientCredentials credentials) =>
+      _inner.addProxyCredentials(host, port, realm, credentials);
+  @override
+  set badCertificateCallback(bool Function(X509Certificate cert, String host, int port)? callback) =>
+      _inner.badCertificateCallback = callback;
+  @override
+  set keyLog(Function(String line)? callback) => _inner.keyLog = callback;
+  @override
+  void close({bool force = false}) => _inner.close(force: force);
 }

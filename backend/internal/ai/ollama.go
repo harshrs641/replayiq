@@ -172,16 +172,17 @@ func (o *OllamaEngine) AnalyzeSession(ctx context.Context, session *models.Sessi
 func groundSummary(summary *models.SessionSummary, frustrationRefs []int, tokenized []models.TokenizedEvent) {
 	cited := citedEvents(truncateEventsForPrompt(tokenized))
 	summary.FrustrationTS = make([]int64, len(summary.Frustrations))
+	summary.FrustrationSrc = make([]string, len(summary.Frustrations))
 	for i, f := range summary.Frustrations {
 		ref := -1
 		if i < len(frustrationRefs) {
 			ref = frustrationRefs[i]
 		}
-		summary.FrustrationTS[i] = resolve(ref, cited, f, tokenized)
+		summary.FrustrationTS[i], summary.FrustrationSrc[i] = resolve(ref, cited, f, tokenized)
 	}
 	for i := range summary.Issues {
 		is := &summary.Issues[i]
-		is.MomentTS = resolve(eventRef(is.Event), cited, is.Title+". "+is.Description, tokenized)
+		is.MomentTS, is.MomentSource = resolve(eventRef(is.Event), cited, is.Title+". "+is.Description, tokenized)
 	}
 }
 

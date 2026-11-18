@@ -16,6 +16,11 @@ package api
 //	    chunk playable on its own (a Meta event is emitted first, retimed to
 //	    that keyframe). The response's "from" says where it actually starts.
 //
+//	GET /api/v1/sessions/{id}/replay/live?after=
+//	    Server-sent events for a session still recording: each "update"
+//	    carries the new manifest and the events stored after `after`
+//	    (see replay_live.go).
+//
 //	GET /api/v1/sessions/{id}/replay/activity
 //	    Only navigation (Meta) and SDK-tagged events (clicks, inputs,
 //	    console, network) for the activity tabs; skips DOM/screenshot data.
@@ -24,7 +29,10 @@ package api
 // raw copy when no masked copy exists, and says so in "masked").
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"net/http"
 	"sort"
@@ -42,21 +50,60 @@ func (r *router) replayStream(w http.ResponseWriter, req *http.Request, sessionI
 	}
 	ctx := req.Context()
 	q := req.URL.Query()
-	src := r.replaySourceFor(ctx, sessionID, q.Get("masked") != "false")
-
-	idx, err := r.cfg.MinIO.SessionIndex(ctx, src.MaskedBucket, sessionID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	var sess *models.Session
 	if r.cfg.DB != nil {
 		sess, _ = r.cfg.DB.GetSession(ctx, sessionID)
 	}
+	if part == "live" {
+		r.replayLive(w, req, sessionID, q.Get("masked") != "false")
+		return
+	}
+	final := isFinal(sess, time.Now())
+	src, idx, err := r.replayLookup(req, sessionID, q.Get("masked") != "false", final)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	w.Header().Set("Cache-Control", replayCacheControl(sess, part))
+
+	// A finished session's chunks never change: keep the gzipped body, so
+	// re-watching it (other viewers, or this one after the browser cache
+	// is gone) costs no storage reads or compression.
+	if final && part != "manifest" && r.replayBodyCache != nil && acceptsGzip(req.Header.Get("Accept-Encoding")) {
+		key := replayBodyKey(sessionID, part, req, idx)
+		body, hit := r.replayBodyCache.Get(key)
+		if !hit {
+			rec := &bodyRecorder{header: http.Header{}, status: http.StatusOK}
+			zw, _ := gzip.NewWriterLevel(&rec.body, gzip.BestCompression)
+			r.writeReplayPart(&gzipWriter{ResponseWriter: rec, zw: zw}, req, sessionID, part, src, idx, sess)
+			zw.Close()
+			if rec.status != http.StatusOK {
+				// Errors aren't cached; send as recorded.
+				copyHeader(w.Header(), rec.header)
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Add("Vary", "Accept-Encoding")
+				w.WriteHeader(rec.status)
+				w.Write(rec.body.Bytes())
+				return
+			}
+			body = rec.body.Bytes()
+			r.replayBodyCache.Put(key, body, int64(len(body)))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Write(body)
+		return
+	}
+
 	w, done := withGzip(w, req)
 	defer done()
+	r.writeReplayPart(w, req, sessionID, part, src, idx, sess)
+}
 
+func (r *router) writeReplayPart(w http.ResponseWriter, req *http.Request, sessionID, part string,
+	src replaySource, idx []storage.BatchIndex, sess *models.Session) {
 	switch part {
 	case "manifest":
 		m := buildManifest(sessionID, src, idx)
@@ -67,11 +114,76 @@ func (r *router) replayStream(w http.ResponseWriter, req *http.Request, sessionI
 	case "activity":
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"session_id":%q,"masked":%t,"events":[`, sessionID, src.Masked())
-		r.cfg.MinIO.StreamEvents(ctx, src.MaskedBucket, idx, math.MinInt64, math.MaxInt64, false, storage.ActivityOnly(), w)
+		r.cfg.MinIO.StreamEvents(req.Context(), src.MaskedBucket, idx, math.MinInt64, math.MaxInt64, false, storage.ActivityOnly(), w)
 		fmt.Fprint(w, "]}")
 	default:
 		writeError(w, http.StatusNotFound, "unknown replay resource")
 	}
+}
+
+// replayLookup is where a session's replay is read from: which copy, and
+// its batch index.
+type replayLookup struct {
+	src replaySource
+	idx []storage.BatchIndex
+}
+
+// replayLookup resolves the copy to serve and lists its batches. For
+// finished sessions the result is cached: that saves the masked-copy
+// checks and an object listing on every manifest, chunk and seek request.
+func (r *router) replayLookup(req *http.Request, sessionID string, masked, final bool) (replaySource, []storage.BatchIndex, error) {
+	key := fmt.Sprintf("%s|%t", sessionID, masked)
+	if final && r.replayIndexCache != nil {
+		if hit, ok := r.replayIndexCache.Get(key); ok {
+			return hit.src, hit.idx, nil
+		}
+	}
+	ctx := req.Context()
+	src := r.replaySourceFor(ctx, sessionID, masked)
+	idx, err := r.cfg.MinIO.SessionIndex(ctx, src.MaskedBucket, sessionID)
+	if err != nil {
+		return src, nil, err
+	}
+	if final && r.replayIndexCache != nil && len(idx) > 0 {
+		r.replayIndexCache.Put(key, replayLookup{src, idx}, 1)
+	}
+	return src, idx, nil
+}
+
+// replayBodyKey identifies one response: the request's range parameters,
+// and the stored objects it is built from (a regenerated masked copy has
+// new object keys, so it never matches an old body).
+func replayBodyKey(sessionID, part string, req *http.Request, idx []storage.BatchIndex) string {
+	q := req.URL.Query()
+	h := fnv.New64a()
+	for _, b := range idx {
+		h.Write([]byte(b.Key))
+	}
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%x", sessionID, part,
+		q.Get("masked"), q.Get("from"), q.Get("to"), q.Get("at"), h.Sum64())
+}
+
+// bodyRecorder captures a handler's response in memory.
+type bodyRecorder struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (b *bodyRecorder) Header() http.Header         { return b.header }
+func (b *bodyRecorder) WriteHeader(code int)        { b.status = code }
+func (b *bodyRecorder) Write(p []byte) (int, error) { return b.body.Write(p) }
+
+func copyHeader(dst, src http.Header) {
+	for k, v := range src {
+		dst[k] = v
+	}
+}
+
+// isFinal reports whether a session's stored replay data can no longer
+// change: it ended more than replaySettleTime ago.
+func isFinal(s *models.Session, now time.Time) bool {
+	return s != nil && s.EndedAt != nil && now.Sub(*s.EndedAt) >= replaySettleTime
 }
 
 // replaySettleTime: after a session ends, the last batches can still be in
@@ -98,7 +210,7 @@ func isLive(s *models.Session, lastEventMs int64, now time.Time) bool {
 // data: re-watching or scrubbing back then costs no request. Sessions still
 // recording (or just ended) are never cached, so the timeline stays live.
 func replayCacheControl(s *models.Session, part string) string {
-	if s == nil || s.EndedAt == nil || time.Since(*s.EndedAt) < replaySettleTime {
+	if !isFinal(s, time.Now()) {
 		return "no-store"
 	}
 	if part == "manifest" {

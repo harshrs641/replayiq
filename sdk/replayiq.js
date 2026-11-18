@@ -4,16 +4,10 @@
  * https://github.com/your-org/replayiq
  */
 (function (global, factory) {
-  console.log('[SDK] UMD wrapper executing. global:', typeof global, 'is window?', global === window);
   if (typeof module !== 'undefined' && module.exports) {
-    console.log('[SDK] Using CommonJS export');
     module.exports = factory();
   } else {
-    console.log('[SDK] Setting global.ReplayIQ');
-    const ReplayIQ = factory();
-    console.log('[SDK] Factory returned:', typeof ReplayIQ);
-    global.ReplayIQ = ReplayIQ;
-    console.log('[SDK] window.ReplayIQ is now:', typeof window.ReplayIQ);
+    global.ReplayIQ = factory();
   }
 })(typeof window !== 'undefined' ? window : typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
@@ -23,6 +17,12 @@
   const RRWEB_CDN = 'https://cdn.jsdelivr.net/npm/rrweb@1.1.3/dist/rrweb.min.js';
   const BATCH_SIZE = 50;
   const FLUSH_INTERVAL_MS = 5000;
+  // Recording pauses (rrweb stops observing the DOM) after a tab has been
+  // hidden this long, or nobody has interacted for this long, and resumes
+  // with a fresh snapshot when the user is back. Both configurable.
+  const PAUSE_WHEN_HIDDEN_MS = 60 * 1000;
+  const PAUSE_WHEN_IDLE_MS = 10 * 60 * 1000;
+  const ACTIVITY_EVENTS = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'wheel'];
 
   // ─── Utilities ──────────────────────────────────────────────────────────────
   function generateId() {
@@ -37,6 +37,39 @@
     let sid = sessionStorage.getItem(KEY);
     if (!sid) { sid = generateId(); sessionStorage.setItem(KEY, sid); }
     return sid;
+  }
+
+  // Sampling is decided once per session (not per page load), so a sampled
+  // session is recorded on every page and an unsampled one on none.
+  function isSessionSampled(rate) {
+    const KEY = '__riq_sampled';
+    try {
+      const saved = sessionStorage.getItem(KEY);
+      if (saved === '1' || saved === '0') return saved === '1';
+      const sampled = Math.random() < rate;
+      sessionStorage.setItem(KEY, sampled ? '1' : '0');
+      return sampled;
+    } catch (e) {
+      return Math.random() < rate;
+    }
+  }
+
+  // Runs fn once the page has loaded and the browser is idle, so loading
+  // and starting the recorder never competes with the page's own startup.
+  function whenIdle(fn) {
+    const idle = () => (window.requestIdleCallback ? window.requestIdleCallback(fn, { timeout: 2000 }) : setTimeout(fn, 1));
+    if (document.readyState === 'complete') idle();
+    else window.addEventListener('load', idle, { once: true });
+  }
+
+  function loadScript(url) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.setAttribute('src', createScriptURL(url));
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('Failed to load ' + url));
+      document.head.appendChild(script);
+    });
   }
 
   function getOrCreateUserId() {
@@ -190,6 +223,8 @@
         endpoint: config.endpoint || 'http://localhost:8080',
         projectId: config.projectId,
         sampleRate: config.sampleRate ?? 1.0,
+        pauseWhenHiddenMs: config.pauseWhenHiddenMs ?? PAUSE_WHEN_HIDDEN_MS,
+        pauseWhenIdleMs: config.pauseWhenIdleMs ?? PAUSE_WHEN_IDLE_MS,
         maskSelectors: config.maskSelectors || [],
         debug: config.debug || false,
         metadata: config.metadata || {},
@@ -202,6 +237,9 @@
       this.stopFn = null;
       this.flushTimer = null;
       this.sessionStarted = Date.now();
+      this.sampled = false;
+      this.rrweb = null;
+      this.paused = false;
       // Callers (e.g. a browser extension running this in a page with a
       // restrictive CSP) can supply their own transport to route requests
       // through a context that isn't bound by the page's connect-src.
@@ -284,6 +322,12 @@
     _startFlushLoop() {
       this.flushTimer = setInterval(() => this._flush(), FLUSH_INTERVAL_MS);
 
+      // Hidden tabs are often never unloaded properly (mobile browsers kill
+      // them without beforeunload): send what we have when the tab hides.
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') this._flush();
+      });
+
       // Flush on page unload
       window.addEventListener('beforeunload', () => {
         clearInterval(this.flushTimer);
@@ -298,18 +342,39 @@
       });
     }
 
-    start(rrweb) {
-      // Sampling
-      if (Math.random() > this.config.sampleRate) {
+    // Starts the session: network/console/behaviour capture right away,
+    // and the DOM recorder (rrweb) once the page is idle. Returns false when
+    // this session isn't sampled; nothing is recorded or downloaded then.
+    start(loadRrweb) {
+      this.sampled = isSessionSampled(this.config.sampleRate);
+      if (!this.sampled) {
         this.log('Session not sampled, skipping.');
-        return;
+        return false;
       }
 
       this._initSession();
       this._startFlushLoop();
 
-      // rrweb recording
-      this.stopFn = rrweb.record({
+      // Network & behavior monitoring
+      const push = e => { this.events.push({ ...e, session_id: this.sessionId }); };
+      interceptNetwork(push);
+      interceptConsole(push);
+      detectBehaviors(push);
+      this._watchActivity();
+
+      whenIdle(() => {
+        loadRrweb()
+          .then(rrweb => { this.rrweb = rrweb; this._record(); })
+          .catch(e => this.log('Recorder failed to load:', e));
+      });
+
+      this.log(`Session started: ${this.sessionId}`);
+      return true;
+    }
+
+    _record() {
+      if (!this.rrweb || this.stopFn || this.paused) return;
+      this.stopFn = this.rrweb.record({
         emit: (event) => {
           this.events.push(event);
           if (this.events.length >= BATCH_SIZE) this._flush();
@@ -326,18 +391,59 @@
         checkoutEveryNth: 200,
         checkoutEveryNms: 30000,
       });
+    }
 
-      // Network & behavior monitoring
-      interceptNetwork(e => { this.events.push({ ...e, session_id: this.sessionId }); });
-      interceptConsole(e => { this.events.push({ ...e, session_id: this.sessionId }); });
-      detectBehaviors(e => { this.events.push({ ...e, session_id: this.sessionId }); });
+    // Stops observing the DOM (a hidden or abandoned tab can keep mutating
+    // it: tickers, timers, polling). Resuming starts with a full snapshot,
+    // so the replay picks up the page exactly as the user finds it again.
+    _pause(reason) {
+      if (this.paused) return;
+      this.paused = true;
+      if (this.stopFn) { this.stopFn(); this.stopFn = null; }
+      this._flush();
+      this.log('Recording paused:', reason);
+    }
 
-      this.log(`Session started: ${this.sessionId}`);
-      return this.sessionId;
+    _resume() {
+      if (!this.paused) return;
+      this.paused = false;
+      this._record();
+      this.log('Recording resumed');
+    }
+
+    _watchActivity() {
+      const { pauseWhenHiddenMs, pauseWhenIdleMs } = this.config;
+      let hiddenTimer = null;
+      let idleTimer = null;
+      const armIdle = () => {
+        clearTimeout(idleTimer);
+        if (pauseWhenIdleMs > 0) idleTimer = setTimeout(() => this._pause('idle'), pauseWhenIdleMs);
+      };
+      // Throttled: mousemove and scroll fire constantly.
+      let last = 0;
+      const onActivity = () => {
+        const now = Date.now();
+        if (now - last < 1000) return;
+        last = now;
+        armIdle();
+        if (!document.hidden) this._resume();
+      };
+      ACTIVITY_EVENTS.forEach(t => window.addEventListener(t, onActivity, { capture: true, passive: true }));
+      document.addEventListener('visibilitychange', () => {
+        clearTimeout(hiddenTimer);
+        if (document.hidden) {
+          if (pauseWhenHiddenMs > 0) hiddenTimer = setTimeout(() => this._pause('hidden'), pauseWhenHiddenMs);
+        } else {
+          armIdle();
+          this._resume();
+        }
+      });
+      armIdle();
     }
 
     stop() {
-      if (this.stopFn) this.stopFn();
+      this.paused = true; // no resuming after an explicit stop
+      if (this.stopFn) { this.stopFn(); this.stopFn = null; }
       clearInterval(this.flushTimer);
       this._flush();
     }
@@ -351,29 +457,18 @@
      * Initialize from script tag or module
      * Usage: ReplayIQ.init({ endpoint: 'https://your-host', projectId: 'proj_xxx' })
      */
+    // Resolves at once with the instance (`instance.sampled` says whether
+    // this session is recorded). rrweb is downloaded only for sampled
+    // sessions, after the page has loaded (override the URL with
+    // config.rrwebUrl to use a locally vendored build instead of the CDN).
     init(config) {
-      return new Promise((resolve, reject) => {
-        if (typeof window === 'undefined') return reject(new Error('ReplayIQ requires a browser environment'));
-
-        if (window.rrweb) {
-          this._instance = new ReplayIQSDK(config);
-          this._instance.start(window.rrweb);
-          resolve(this._instance);
-          return;
-        }
-
-        // Lazy-load rrweb (override with config.rrwebUrl to point at a
-        // locally vendored build instead of the CDN)
-        const script = document.createElement('script');
-        script.setAttribute('src', createScriptURL(config.rrwebUrl || RRWEB_CDN));
-        script.onload = () => {
-          this._instance = new ReplayIQSDK(config);
-          this._instance.start(window.rrweb);
-          resolve(this._instance);
-        };
-        script.onerror = () => reject(new Error('Failed to load rrweb'));
-        document.head.appendChild(script);
-      });
+      if (typeof window === 'undefined') return Promise.reject(new Error('ReplayIQ requires a browser environment'));
+      if (this._instance) return Promise.resolve(this._instance);
+      const instance = (this._instance = new ReplayIQSDK(config));
+      instance.start(() => (window.rrweb
+        ? Promise.resolve(window.rrweb)
+        : loadScript(config.rrwebUrl || RRWEB_CDN).then(() => window.rrweb)));
+      return Promise.resolve(instance);
     },
 
     identify(userId, traits) {

@@ -4,6 +4,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/harshrs641/replayiq/internal/ai"
 	"github.com/harshrs641/replayiq/internal/jira"
@@ -65,6 +66,10 @@ type router struct {
 	queryEmbedCache *embedCache
 	// eventLimiter enforces per-project burst limits on POST /api/v1/events.
 	eventLimiter *eventRateLimiter
+	// Replay data of finished sessions, which no longer changes (see
+	// replay_stream.go): where to read it, and gzipped response bodies.
+	replayIndexCache *lruCache[replayLookup]
+	replayBodyCache  *lruCache[[]byte]
 }
 
 func newBaseRouter(cfg RouterConfig) *router {
@@ -79,6 +84,10 @@ func newBaseRouter(cfg RouterConfig) *router {
 		mux:             http.NewServeMux(),
 		queryEmbedCache: newEmbedCache(1000),
 		eventLimiter:    newEventRateLimiter(20, 60),
+		// TTL: a regenerated masked copy (backfill-mask -force) shows up
+		// within 5 minutes, like the manifest's browser max-age.
+		replayIndexCache: newLRUCache[replayLookup](5000, 5*time.Minute),
+		replayBodyCache:  newLRUCache[[]byte](128<<20, time.Hour),
 	}
 }
 
