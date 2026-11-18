@@ -224,7 +224,17 @@ For playback, the dashboard streams it like a video instead: it loads the first 
 | `GET .../replay/events?at=&to=` | Jump: starts at the last keyframe at or before `at`, with a Meta event first so the chunk plays on its own. `from` in the response says where it starts. |
 | `GET .../replay/activity` | Navigation plus SDK-tagged events (clicks, inputs, console, network) for the Behaviour/Console/Network tabs. |
 
-All accept `masked=true|false` like `/replay`. Each stored batch carries its time range and keyframes as object metadata, so the manifest is one listing call. Batches stored before this was added are read once to build their index, and the result is cached in memory.
+All accept `masked=true|false` like `/replay` and are gzip-compressed (about 6x for DOM events). Once a session has ended, its chunks are cacheable by the browser for a day and its manifest for 5 minutes; sessions still recording are never cached.
+
+Each stored batch carries its time range and keyframes as object metadata, so the manifest is one listing call. Batches stored before that are read once to build their index, cached in memory; run `go run ./cmd/backfill-index` (from `backend/`, with the same `MINIO_*` env) once to write the index into them for good.
+
+**Live sessions:** while a session is still recording (no end signal yet, or ended under 2 minutes ago; a session with no events for 5 minutes stops counting), the manifest says `"live": true`. The player then opens at the newest moment, polls every 3 s and follows new events like a live stream (a **LIVE** / **GO LIVE** button under it).
+
+**Jump to findings:** `GET /api/v1/sessions/:id/moments` returns when each AI frustration and issue happened. The analysis prompt numbers the events and asks the model to cite the one each finding is about; findings without a usable citation, and sessions analysed before this, are placed by matching their text against the events (`source: "matched"`, shown as "≈"). The dashboard puts a ▶ button on each finding, and the Issues tab has "Watch in replay".
+
+**Links:** `http://<dashboard>/?session=<id>&t=<seconds>` opens a session at that moment; "Copy link at this moment" above the player makes one.
+
+The web SDK takes a keyframe at least every 30 s of activity (`checkoutEveryNms`), so a seek never replays more than that. Mobile batches from the Mixpanel adapter are sent with `device_masked: true`: their pixels are masked on the phone, so no second, server-masked copy is stored and replays serve the single copy as "Masked on device".
 
 ### Trigger analysis manually
 

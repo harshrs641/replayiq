@@ -11,6 +11,12 @@ dependencies:
   flutter:
     sdk: flutter
   mixpanel_flutter_session_replay: ^2.1.0
+  # ReplayIQ companion (lib/replayiq_companion.dart); the SDK already uses it.
+  http: ^1.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
 
 flutter:
   uses-material-design: true

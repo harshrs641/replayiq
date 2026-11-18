@@ -25,6 +25,9 @@ type Session struct {
 	AITags         []string  `json:"ai_tags,omitempty" db:"ai_tags"`
 	AIGoalAchieved *bool     `json:"ai_goal_achieved,omitempty" db:"ai_goal_achieved"`
 	AIFrustrations []string  `json:"ai_frustrations,omitempty" db:"ai_frustrations"`
+	// AIFrustrationTS[i] is when AIFrustrations[i] happened (unix ms, 0 =
+	// unknown); lets the dashboard jump the replay to it.
+	AIFrustrationTS []int64 `json:"ai_frustration_ts,omitempty" db:"ai_frustration_ts"`
 	AIProcessedAt  *time.Time `json:"ai_processed_at,omitempty" db:"ai_processed_at"`
 	// AIStatus tracks pipeline progress: pending | queued | analyzing |
 	// embedding | complete | failed.
@@ -45,6 +48,11 @@ type EventBatch struct {
 	Events       []RRWebEvent   `json:"events"`
 	CustomEvents []CustomEvent  `json:"custom_events"`
 	FlushedAt    time.Time      `json:"flushed_at"`
+	// DeviceMasked: the recorder already masked this batch on the device
+	// (mobile screenshots are masked as pixels before upload). Server-side
+	// masking only redacts DOM text and attributes, so no masked copy is
+	// stored and replays serve this copy as the masked view.
+	DeviceMasked bool `json:"device_masked,omitempty"`
 }
 
 type RRWebEvent struct {
@@ -60,6 +68,12 @@ type RRWebEvent struct {
 	Method   string `json:"method,omitempty"`
 	Duration int64  `json:"duration,omitempty"`
 	Selector string `json:"selector,omitempty"` // target element for behavior events (e.g. rage_click)
+	// Error details (js_error) and failure reason (network status 0).
+	Filename string `json:"filename,omitempty"`
+	Lineno   int    `json:"lineno,omitempty"`
+	Colno    int    `json:"colno,omitempty"`
+	Stack    string `json:"stack,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type CustomEvent struct {
@@ -81,6 +95,8 @@ type AIIssue struct {
 	Tags        []string  `json:"tags" db:"tags"`
 	JiraKey     string    `json:"jira_key,omitempty" db:"jira_key"`
 	JiraURL     string    `json:"jira_url,omitempty" db:"jira_url"`
+	// MomentTS: when in the session the issue happened (unix ms, 0 = unknown).
+	MomentTS int64 `json:"moment_ts,omitempty" db:"moment_ts"`
 	CreatedAt   time.Time `json:"created_at" db:"created_at"`
 }
 
@@ -110,6 +126,8 @@ type SessionSummary struct {
 	GoalAchieved   bool     `json:"goal_achieved"`
 	GoalEvidence   string   `json:"goal_evidence"`
 	Frustrations   []string `json:"frustrations"`
+	// FrustrationTS[i]: when Frustrations[i] happened (unix ms, 0 = unknown).
+	FrustrationTS []int64 `json:"frustration_ts,omitempty"`
 	KeyMoments     []string `json:"key_moments"`
 	Tags           []string `json:"tags"`
 	// Tokenized events (~8KB)
@@ -132,4 +150,8 @@ type DetectedIssue struct {
 	Description string `json:"description"`
 	Severity    string `json:"severity"`
 	Tags        []string `json:"tags"`
+	// Event: index of the tokenized event the model cites (number or
+	// numeric string; may be missing). Resolved into MomentTS.
+	Event    any   `json:"event,omitempty"`
+	MomentTS int64 `json:"moment_ts,omitempty"`
 }

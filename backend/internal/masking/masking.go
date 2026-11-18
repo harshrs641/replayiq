@@ -186,15 +186,39 @@ func MaskBatch(t *Tracker, batch *models.EventBatch, cfg Config) *models.EventBa
 // behavior events don't carry a `data` payload at all - see models.RRWebEvent)
 // and native rrweb events' nested Data tree.
 func maskEvent(t *Tracker, sessionID string, e models.RRWebEvent, cfg Config) models.RRWebEvent {
-	e.Message = maskText(e.Message, cfg)
-	e.URL = maskText(e.URL, cfg)
-	e.Selector = maskText(e.Selector, cfg)
+	e = maskTextFields(e, cfg)
 	if e.Data != nil {
 		if data, ok := maskValue(t, sessionID, e.Data, cfg, false).(map[string]any); ok {
 			e.Data = data
 		}
 	}
 	return e
+}
+
+// maskTextFields masks the SDK's flat free-text fields only.
+func maskTextFields(e models.RRWebEvent, cfg Config) models.RRWebEvent {
+	e.Message = maskText(e.Message, cfg)
+	e.URL = maskText(e.URL, cfg)
+	e.Selector = maskText(e.Selector, cfg)
+	e.Filename = maskText(e.Filename, cfg)
+	e.Stack = maskText(e.Stack, cfg)
+	e.Error = maskText(e.Error, cfg)
+	return e
+}
+
+// MaskTextFields returns a copy of batch with PII redacted in the events'
+// free-text fields (message, URL, selector, error details) but each event's
+// Data left as is. For device-masked batches (mobile): their pixels were
+// masked on the phone, but console/network/error text from the app was not,
+// and these sessions keep a single stored copy. Skipping Data avoids running
+// the regexes over base64 screenshots.
+func MaskTextFields(batch *models.EventBatch, cfg Config) *models.EventBatch {
+	out := *batch
+	out.Events = make([]models.RRWebEvent, len(batch.Events))
+	for i, e := range batch.Events {
+		out.Events[i] = maskTextFields(e, cfg)
+	}
+	return &out
 }
 
 // maskValue walks an arbitrary rrweb payload (map[string]any / []any /

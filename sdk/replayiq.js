@@ -125,18 +125,25 @@
     ['error', 'warn'].forEach(level => {
       const orig = console[level].bind(console);
       console[level] = function (...args) {
-        onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'console', level, message: args.map(String).join(' '), timestamp: Date.now() });
+        const err = args.find(a => a instanceof Error);
+        onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'console', level, message: args.map(String).join(' '), stack: stackOf(err), timestamp: Date.now() });
         orig(...args);
       };
     });
 
     window.addEventListener('error', e => {
-      onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'js_error', message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno, timestamp: Date.now() });
+      onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'js_error', message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno, stack: stackOf(e.error), timestamp: Date.now() });
     });
 
     window.addEventListener('unhandledrejection', e => {
-      onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'js_error', message: String(e.reason), timestamp: Date.now() });
+      const r = e.reason;
+      onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'js_error', message: 'Unhandled rejection: ' + (r && r.message ? r.message : String(r)), stack: stackOf(r), timestamp: Date.now() });
     });
+  }
+
+  // Stacks can be long (minified bundles); keep enough to locate the frame.
+  function stackOf(err) {
+    return err && typeof err.stack === 'string' ? err.stack.slice(0, 4000) : undefined;
   }
 
   // ─── Rage / Dead Click Detection ────────────────────────────────────────────
@@ -312,7 +319,12 @@
         maskInputSelector: PII_SELECTORS.join(','),
         collectFonts: true,
         recordCanvas: false,
+        // Keyframes (Meta + FullSnapshot) that replay can start from. Event
+        // count alone leaves quiet pages with one keyframe for many minutes,
+        // so jumping late in a long session replays it all from the start;
+        // the time bound caps a seek's catch-up at 30 s of events.
         checkoutEveryNth: 200,
+        checkoutEveryNms: 30000,
       });
 
       // Network & behavior monitoring

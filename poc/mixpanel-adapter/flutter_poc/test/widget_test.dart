@@ -1,30 +1,18 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:replayiq_mobile_poc/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
-
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+  testWidgets('checkout screen renders and explains a missing RIQ_URL', (tester) async {
+    await tester.pumpWidget(const PocApp());
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('Checkout'), findsOneWidget);
+    expect(find.text('Pay now'), findsOneWidget);
+    expect(find.text('Load prices (fails)'), findsOneWidget);
+    expect(find.textContaining('RIQ_URL not set'), findsOneWidget);
+
+    // Stop the companion's flush timer (widget tests fail on pending timers).
+    await companion.dispose();
   });
 }

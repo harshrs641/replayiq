@@ -40,6 +40,9 @@ const (
 	metaCount = "Riq-Count"
 	metaFulls = "Riq-Fulls"
 	metaMetas = "Riq-Metas"
+	// Set on batches the recorder masked on the device (see
+	// models.EventBatch.DeviceMasked); such sessions have no masked copy.
+	metaDeviceMasked = "Riq-Device-Masked"
 
 	// S3 caps user metadata at 2 KB per object; a 13-digit timestamp plus a
 	// comma is 14 bytes, so 48 per list keeps both lists well under it.
@@ -141,19 +144,40 @@ func (ix BatchIndex) toMetadata() map[string]string {
 	}
 }
 
+// metaValue looks up a user-metadata value. Header names come back in
+// varying case and with or without the X-Amz-Meta- prefix depending on the
+// server, so match loosely.
+func metaValue(md map[string]string, name string) (string, bool) {
+	for k, v := range md {
+		k = strings.TrimPrefix(strings.ToLower(k), "x-amz-meta-")
+		if k == strings.ToLower(name) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// IsDeviceMasked reports whether the session's first stored raw batch was
+// masked on the device. Reads one listing entry; no object is downloaded.
+func (m *MinIO) IsDeviceMasked(ctx context.Context, sessionID string) bool {
+	prefix := fmt.Sprintf("sessions/%s/", sessionID)
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for obj := range m.client.ListObjects(lctx, m.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true, WithMetadata: true, MaxKeys: 1}) {
+		if obj.Err != nil {
+			return false
+		}
+		v, _ := metaValue(obj.UserMetadata, metaDeviceMasked)
+		return v == "1"
+	}
+	return false
+}
+
 // indexFromMetadata reads the index back from a listing. Header names come
 // back in varying case and with or without the X-Amz-Meta- prefix depending
 // on the server, so match loosely.
 func indexFromMetadata(md map[string]string) (BatchIndex, bool) {
-	get := func(name string) (string, bool) {
-		for k, v := range md {
-			k = strings.TrimPrefix(strings.ToLower(k), "x-amz-meta-")
-			if k == strings.ToLower(name) {
-				return v, true
-			}
-		}
-		return "", false
-	}
+	get := func(name string) (string, bool) { return metaValue(md, name) }
 	firstS, ok1 := get(metaFirst)
 	lastS, ok2 := get(metaLast)
 	if !ok1 || !ok2 {
@@ -380,4 +404,66 @@ func (m *MinIO) StreamEvents(ctx context.Context, masked bool, idx []BatchIndex,
 		}
 	}
 	return n, nil
+}
+
+// BackfillResult summarises a BackfillIndex run.
+type BackfillResult struct {
+	Scanned, AlreadyIndexed, Updated, Failed int
+}
+
+// BackfillIndex writes the replay index into the metadata of every stored
+// batch that lacks it (objects written before the index existed), so their
+// sessions' manifests no longer read them in full. Each object is copied
+// onto itself with its content, content type and existing metadata kept.
+// With dryRun it only counts. Safe to re-run: indexed objects are skipped.
+func (m *MinIO) BackfillIndex(ctx context.Context, masked, dryRun bool, logf func(format string, args ...any)) (BackfillResult, error) {
+	var res BackfillResult
+	bucket := m.bucketFor(masked)
+	for obj := range m.client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: "sessions/", Recursive: true, WithMetadata: true}) {
+		if obj.Err != nil {
+			return res, obj.Err
+		}
+		res.Scanned++
+		if _, ok := indexFromMetadata(obj.UserMetadata); ok {
+			res.AlreadyIndexed++
+			continue
+		}
+		if dryRun {
+			res.Updated++
+			continue
+		}
+		if err := m.writeIndex(ctx, bucket, obj.Key); err != nil {
+			res.Failed++
+			logf("index %s/%s: %v", bucket, obj.Key, err)
+			continue
+		}
+		res.Updated++
+	}
+	return res, nil
+}
+
+func (m *MinIO) writeIndex(ctx context.Context, bucket, key string) error {
+	events, err := m.readRawBatch(ctx, bucket, key)
+	if err != nil {
+		return err
+	}
+	stat, err := m.client.StatObject(ctx, bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		return err
+	}
+	md := map[string]string{}
+	for k, v := range stat.UserMetadata {
+		md[k] = v
+	}
+	for k, v := range indexEvents(headersOf(events)).toMetadata() {
+		md[k] = v
+	}
+	if stat.ContentType != "" {
+		md["Content-Type"] = stat.ContentType
+	}
+	_, err = m.client.CopyObject(ctx,
+		minio.CopyDestOptions{Bucket: bucket, Object: key, UserMetadata: md, ReplaceMetadata: true},
+		minio.CopySrcOptions{Bucket: bucket, Object: key, MatchETag: stat.ETag},
+	)
+	return err
 }

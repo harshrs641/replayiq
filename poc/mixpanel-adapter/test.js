@@ -132,6 +132,7 @@ test('forwards rrweb events and adds href to Meta (so the tokenizer sees "naviga
   assert.deepEqual(tokenize(evs).filter((t) => t.action === 'navigate'), [{ action: 'navigate', target: 'app://flutter' }]);
   const batch = h.mock.calls.find((c) => c.path === '/api/v1/events').body;
   assert.equal(batch.session_id, 'rp_test_1');
+  assert.equal(batch.device_masked, true, 'mobile batches are already masked on the device');
   assert.equal(batch.project_id, 'demo');
   assert.ok(Array.isArray(batch.custom_events));
   await h.adapter.endAll();
@@ -299,4 +300,59 @@ test('end to end: frames become swaps, and every later keyframe gets its own Met
   assert.equal(metas[1].data.width, 390, 'keyframe Meta carries the screen size');
   await h.adapter.endAll();
   await h.close();
+});
+
+// ── Companion events (console / network / errors / navigation from the app) ──
+
+function companionPost(h, body, { token = 'demo' } = {}) {
+  return fetch(`http://127.0.0.1:${h.port}/riq/events`, {
+    method: 'POST',
+    headers: { Authorization: 'Basic ' + Buffer.from(`${token}:`).toString('base64'), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+test('companion events join the replay session, filtered to known kinds and fields', async (t) => {
+  const h = await harness(t, { allowedTokens: ['demo'] });
+  const t0 = 1_800_000_000_000;
+  await h.upload([meta(t0), fullSnapshot(t0 + 5)]);
+  const res = await companionPost(h, {
+    replay_id: 'rp_test_1', distinct_id: 'user_42', os: 'iOS',
+    events: [
+      { subtype: 'navigate', url: 'app://flutter/order-summary', timestamp: t0 + 1000 },
+      { subtype: 'network', method: 'POST', url: 'https://api.test/pay', status: 0, error: 'SocketException', duration: 12, timestamp: t0 + 2000 },
+      { subtype: 'js_error', message: 'Bad state', stack: '#0 main', timestamp: t0 + 3000, secret: 'dropped' },
+      { subtype: 'rrweb_hack', timestamp: t0 + 4000 },   // unknown kind: dropped
+      { subtype: 'console', level: 'log', message: 'no timestamp' }, // dropped
+    ],
+  });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).accepted, 3);
+  assert.equal(h.mock.calls.filter((c) => c.path === '/api/v1/sessions').length, 1, 'reuses the session the screenshots created');
+  const post = h.mock.calls.filter((c) => c.path === '/api/v1/events').at(-1).body;
+  assert.equal(post.session_id, 'rp_test_1');
+  assert.equal(post.device_masked, true);
+  const [nav, net, err] = post.events;
+  assert.deepEqual(nav, { type: 5, timestamp: t0 + 1000, session_id: 'rp_test_1', subtype: 'navigate', url: 'app://flutter/order-summary' });
+  assert.equal(net.error, 'SocketException');
+  assert.equal(net.status, 0);
+  assert.equal(err.stack, '#0 main');
+  assert.equal(err.secret, undefined, 'unknown fields are not forwarded');
+});
+
+test('companion events can arrive before any screenshot and create the session', async (t) => {
+  const h = await harness(t);
+  const res = await companionPost(h, { replay_id: 'rp_new', distinct_id: 'u', events: [{ subtype: 'console', level: 'error', message: 'boom', timestamp: 1_800_000_000_500 }] });
+  assert.equal(res.status, 200);
+  const create = h.mock.calls.find((c) => c.path === '/api/v1/sessions').body;
+  assert.equal(create.session_id, 'rp_new');
+  assert.equal(new Date(create.started_at).getTime(), 1_800_000_000_500);
+});
+
+test('companion route rejects unknown tokens and malformed bodies', async (t) => {
+  const h = await harness(t, { allowedTokens: ['demo'] });
+  assert.equal((await companionPost(h, { replay_id: 'x', events: [] }, { token: 'nope' })).status, 401);
+  assert.equal((await companionPost(h, { events: [] })).status, 400);
+  assert.equal((await companionPost(h, { replay_id: 'x', events: 'no' })).status, 400);
+  assert.equal(h.mock.calls.length, 0);
 });

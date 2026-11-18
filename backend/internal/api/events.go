@@ -44,22 +44,33 @@ func (r *router) handleEvents(w http.ResponseWriter, req *http.Request) {
 		r.cfg.DB.IncrementEventCount(ctx, batch.SessionID, len(batch.Events))
 
 		// 2. Mask and publish both copies to Kafka; Storage Worker writes them
-		//    to MinIO.
-		masked := masking.MaskBatch(r.cfg.MaskTracker, &batch, r.cfg.Masking)
+		//    to MinIO. Device-masked batches keep one copy, with only their
+		//    free-text fields (app logs, URLs) redacted here.
+		if batch.DeviceMasked {
+			batch = *masking.MaskTextFields(&batch, r.cfg.Masking)
+		}
 		if err := r.cfg.Producer.Publish(kafka.TopicEventsRaw, batch.SessionID, &batch); err != nil {
 			slog.Error("kafka publish events.raw failed", "error", err)
 		}
-		if err := r.cfg.Producer.Publish(kafka.TopicEventsMasked, batch.SessionID, masked); err != nil {
-			slog.Error("kafka publish events.masked failed", "error", err)
+		if !batch.DeviceMasked {
+			masked := masking.MaskBatch(r.cfg.MaskTracker, &batch, r.cfg.Masking)
+			if err := r.cfg.Producer.Publish(kafka.TopicEventsMasked, batch.SessionID, masked); err != nil {
+				slog.Error("kafka publish events.masked failed", "error", err)
+			}
 		}
 	} else {
 		// Monolith mode: write directly to MinIO.
+		if batch.DeviceMasked {
+			batch = *masking.MaskTextFields(&batch, r.cfg.Masking)
+		}
 		if _, err := r.cfg.MinIO.StoreEvents(ctx, batch.SessionID, &batch); err != nil {
 			slog.Error("minio store failed", "error", err)
 		}
-		masked := masking.MaskBatch(r.cfg.MaskTracker, &batch, r.cfg.Masking)
-		if _, err := r.cfg.MinIO.StoreMaskedEvents(ctx, batch.SessionID, masked); err != nil {
-			slog.Error("minio masked store failed", "error", err)
+		if !batch.DeviceMasked {
+			masked := masking.MaskBatch(r.cfg.MaskTracker, &batch, r.cfg.Masking)
+			if _, err := r.cfg.MinIO.StoreMaskedEvents(ctx, batch.SessionID, masked); err != nil {
+				slog.Error("minio masked store failed", "error", err)
+			}
 		}
 		r.cfg.DB.IncrementEventCount(ctx, batch.SessionID, len(batch.Events))
 	}

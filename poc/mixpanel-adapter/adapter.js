@@ -236,19 +236,15 @@ function createAdapter(userConfig = {}) {
     return out;
   }
 
-  async function processBatch(meta, events) {
-    const s = stateFor(meta.replayId);
-    clearTimeout(s.timer);
+  // Creates the ReplayIQ session on first sight of a replay_id, from either
+  // the SDK's screenshots or the companion's events (whichever lands first).
+  async function ensureSession(s, meta, events) {
     s.projectId = meta.projectId;
     s.userId = meta.distinctId || s.userId || 'anonymous';
     if (!s.startedAt) {
       const firstTs = events.reduce((m, e) => (e.timestamp && (!m || e.timestamp < m) ? e.timestamp : m), 0);
       s.startedAt = meta.startedAtMs || firstTs || Date.now();
     }
-    for (const e of events) {
-      if (e.type === T_META && e.data && e.data.width) { s.width = e.data.width; s.height = e.data.height; }
-    }
-
     if (!s.created) {
       await riq('/api/v1/sessions', {
         session_id: s.replayId,
@@ -264,6 +260,21 @@ function createAdapter(userConfig = {}) {
       }, s.projectId);
       s.created = true;
     }
+  }
+
+  function armIdleTimer(s) {
+    clearTimeout(s.timer);
+    s.timer = setTimeout(() => endSession(s.replayId).catch((e) => cfg.log('end failed', e.message)), cfg.idleMs);
+    if (s.timer.unref) s.timer.unref();
+  }
+
+  async function processBatch(meta, events) {
+    const s = stateFor(meta.replayId);
+    clearTimeout(s.timer);
+    for (const e of events) {
+      if (e.type === T_META && e.data && e.data.width) { s.width = e.data.width; s.height = e.data.height; }
+    }
+    await ensureSession(s, meta, events);
 
     const ordered = events
       .map((e, i) => [e, i])
@@ -308,12 +319,71 @@ function createAdapter(userConfig = {}) {
         events: chunk,
         custom_events: [],
         flushed_at: new Date().toISOString(),
+        // The SDK masks pixels on the phone; ReplayIQ's text masking can't
+        // redact pixels, so it skips the second (masked) copy.
+        device_masked: true,
       }, s.projectId);
     }
 
-    s.timer = setTimeout(() => endSession(s.replayId).catch((e) => cfg.log('end failed', e.message)), cfg.idleMs);
-    if (s.timer.unref) s.timer.unref();
+    armIdleTimer(s);
     cfg.log(`batch ok replay=${s.replayId} in=${events.length} out=${out.length}`);
+  }
+
+  // Console, network, error and navigation events from the app (the Flutter
+  // companion in flutter_poc/lib/replayiq_companion.dart), in the web SDK's
+  // shapes. The Mixpanel SDK doesn't record these; the companion tags them
+  // with the SDK's replay id so they land in the same session.
+  const COMPANION_SUBTYPES = new Set(['console', 'network', 'js_error', 'navigate']);
+  const COMPANION_FIELDS = ['subtype', 'level', 'message', 'url', 'status', 'method', 'duration', 'filename', 'lineno', 'colno', 'stack', 'error'];
+
+  async function handleCompanion(req, res) {
+    const token = basicUser(req.headers.authorization);
+    if (cfg.allowedTokens.length && !cfg.allowedTokens.includes(token)) throw new HttpError(401, 'unknown token');
+    const body = await readBody(req, cfg.maxBodyBytes);
+    let payload;
+    try {
+      payload = JSON.parse((isGzip(body) ? zlib.gunzipSync(body) : body).toString('utf8'));
+    } catch (e) {
+      throw new HttpError(400, `invalid payload: ${e.message}`);
+    }
+    const replayId = payload && typeof payload.replay_id === 'string' ? payload.replay_id : '';
+    if (!replayId) throw new HttpError(400, 'replay_id is required');
+    if (!Array.isArray(payload.events)) throw new HttpError(400, 'events must be an array');
+
+    // Only known event kinds and fields pass through.
+    const events = payload.events
+      .filter((e) => e && COMPANION_SUBTYPES.has(e.subtype) && Number.isFinite(e.timestamp))
+      .map((e) => {
+        const out = { type: T_CUSTOM, timestamp: Math.round(e.timestamp), session_id: replayId };
+        for (const k of COMPANION_FIELDS) if (e[k] !== undefined && e[k] !== null) out[k] = e[k];
+        return out;
+      });
+    if (events.length) {
+      const s = stateFor(replayId);
+      clearTimeout(s.timer);
+      await ensureSession(s, {
+        replayId,
+        projectId: cfg.projectId || token || 'mobile',
+        distinctId: typeof payload.distinct_id === 'string' ? payload.distinct_id : '',
+        os: typeof payload.os === 'string' ? payload.os : '',
+      }, events);
+      s.lastTs = Math.max(s.lastTs || 0, ...events.map((e) => e.timestamp));
+      for (const chunk of chunkEvents(events, cfg.maxChunkBytes)) {
+        await riq('/api/v1/events', {
+          session_id: replayId,
+          project_id: s.projectId,
+          events: chunk,
+          custom_events: [],
+          flushed_at: new Date().toISOString(),
+          // Same session as the screenshots, which are masked on the phone;
+          // ReplayIQ still redacts these events' text fields.
+          device_masked: true,
+        }, s.projectId);
+      }
+      armIdleTimer(s);
+      cfg.log(`companion ok replay=${replayId} events=${events.length}`);
+    }
+    send(res, 200, { status: 'ok', accepted: events.length });
   }
 
   async function endSession(replayId) {
@@ -381,6 +451,7 @@ function createAdapter(userConfig = {}) {
       if (req.method === 'GET' && path.endsWith('/health')) return send(res, 200, { status: 'ok', active_sessions: sessions.size });
       if (req.method === 'GET' && path.endsWith('/settings')) return send(res, 200, {});
       if (req.method === 'POST' && path.endsWith('/record')) return await handleRecord(req, res, url);
+      if (req.method === 'POST' && path.endsWith('/riq/events')) return await handleCompanion(req, res);
       send(res, 404, { error: 'not found' });
     } catch (e) {
       const status = e instanceof HttpError ? e.status : 500;

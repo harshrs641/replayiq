@@ -164,6 +164,13 @@ function SessionRow({ session, selected, onClick }) {
             <span style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace" }}>
               {session.session_id?.slice(0, 8)}
             </span>
+            {!session.ended_at && session.started_at && Date.now() - new Date(session.started_at).getTime() < 30 * 60000 && (
+              // No end signal yet and recent: probably still recording
+              // (the replay's manifest says for sure).
+              <span style={{ fontSize: 10, fontWeight: 700, color: C.text, display: "inline-flex", alignItems: "center", gap: 4 }}>
+                <span style={{ width: 6, height: 6, borderRadius: "50%", background: C.ink, animation: "pulse 1.4s infinite" }} />live
+              </span>
+            )}
             {frustrated && <span style={{ fontSize: 10, fontWeight: 700, color: C.text }}>▲ frustrated</span>}
             {session.ai_goal_achieved === true && <span style={{ fontSize: 10, color: C.textMuted }}>✓ goal met</span>}
             {session.ai_goal_achieved === false && <span style={{ fontSize: 10, color: C.textMuted }}>✕ goal missed</span>}
@@ -212,7 +219,37 @@ function SessionRow({ session, selected, onClick }) {
 
 const CHUNK_MS = 20000;
 const AHEAD_MS = 15000;
-const END_MARKER_TAG = "riq-end";
+// Live sessions: how often to check for new events, and how close to the
+// newest event the playhead must be to count as watching live.
+const LIVE_POLL_MS = 3000;
+const LIVE_EDGE_MS = 4000;
+// Empty tag + transparent colour: rrweb-player draws a marker for every
+// custom event, and this one only exists to stretch the timeline.
+const END_MARKER_TAG = "";
+
+// Problems shown as ticks on the player's scrubber (rrweb-player draws one
+// per Custom event, coloured via its `tags` map, with the tag as tooltip).
+const MARKER_COLORS = { error: C.ink, network: "#52525b", rage: "#a1a1aa" };
+const MAX_MARKERS = 300;
+
+function countBy(list, key) {
+  const out = {};
+  for (const x of list) out[key(x)] = (out[key(x)] || 0) + 1;
+  return out;
+}
+
+function buildMarkers(activityEvents, sessionStart) {
+  const a = buildActivity(activityEvents, sessionStart);
+  const out = [];
+  const add = (r, kind, label) => out.push({ ts: r.ts, kind, tag: `${label} · ${clock(r.at)}` });
+  a.console.filter(c => c.level === "error" || c.level === "exception")
+    .forEach(c => add(c, "error", `Error: ${String(c.message || "").slice(0, 80)}`));
+  a.network.filter(n => !n.status || n.status >= 400)
+    .forEach(n => add(n, "network", `${n.method} ${shortUrl(n.url || "")} → ${n.status || "failed"}`));
+  a.behaviour.filter(b => b.kind === "rage_click")
+    .forEach(b => add(b, "rage", `Rage click: ${b.detail || ""}`));
+  return out.sort((x, y) => x.ts - y.ts).slice(0, MAX_MARKERS);
+}
 
 // Custom (type 5) events without { tag, payload } are the SDK's analytics
 // metadata, not replayable; rrweb-player crashes on them (data.tag of
@@ -241,6 +278,7 @@ class ReplayStreamer {
     this.destroyed = false;
     this.listeners = new Set();
     this.loadedEvents = 0;
+    if (import.meta.env?.DEV) window.__replayStreamer = this; // debugging aid
   }
 
   url(params) {
@@ -259,9 +297,19 @@ class ReplayStreamer {
   }
 
   async start() {
-    const res = await fetch(`${API}/api/v1/sessions/${this.sessionId}/replay/manifest?masked=${this.masked}`);
+    const base = `${API}/api/v1/sessions/${this.sessionId}/replay`;
+    const [res, activity] = await Promise.all([
+      fetch(`${base}/manifest?masked=${this.masked}`),
+      // Small (navigation + SDK-tagged events); feeds the scrubber markers
+      // and the activity tabs. A failure only costs the markers.
+      fetch(`${base}/activity?masked=${this.masked}`)
+        .then(r => (r.ok ? r.json() : { events: [] }))
+        .then(d => (d.events || []).sort((a, b) => a.timestamp - b.timestamp))
+        .catch(() => []),
+    ]);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const m = (this.manifest = await res.json());
+    this.activity = activity;
     if (!m.events) return { empty: "No events were recorded for this session." };
     if (!m.keyframes.length) {
       return { empty: "No full page snapshot was captured for this session (it may predate a fix, or recording was interrupted). Record a new session to replay it." };
@@ -274,9 +322,68 @@ class ReplayStreamer {
     this.zero = this.events[0]?.timestamp ?? m.start; // player time 0
     // End marker: makes the scrubber span the whole session from the start.
     insertSorted(this.events, [{ type: 5, timestamp: m.end, data: { tag: END_MARKER_TAG, payload: {} } }]);
+    // rrweb-player places markers once, as a % of the timeline at creation;
+    // on a live session that keeps growing they would drift, so skip them.
+    this.markers = m.live ? [] : buildMarkers(activity, m.start).filter(k => k.ts >= this.zero && k.ts <= m.end);
+    this.tags = { [END_MARKER_TAG]: "transparent" };
+    for (const k of this.markers) this.tags[k.tag] = MARKER_COLORS[k.kind];
+    insertSorted(this.events, this.markers.map(k => ({ type: 5, timestamp: k.ts, data: { tag: k.tag, payload: {} } })));
     this.ranges = [[m.start, to]];
     this.createPlayer(0, false);
-    return { manifest: m };
+    if (m.live) {
+      // Like a live stream: open at the newest moment and keep following.
+      this.liveTimer = setInterval(() => this.pollLive(), LIVE_POLL_MS);
+      this.goLive();
+    }
+    return { manifest: m, activity };
+  }
+
+  // ── Live sessions ──
+
+  atLiveEdge() {
+    return this.now != null && this.now >= this.manifest.end - LIVE_EDGE_MS;
+  }
+
+  goLive() {
+    this.seekAbs(this.manifest.end - 2000, true);
+  }
+
+  async pollLive() {
+    if (this.polling || this.destroyed) return;
+    this.polling = true;
+    try {
+      const base = `${API}/api/v1/sessions/${this.sessionId}/replay`;
+      const [m, activity] = await Promise.all([
+        fetch(`${base}/manifest?masked=${this.masked}`).then(r => (r.ok ? r.json() : null)),
+        fetch(`${base}/activity?masked=${this.masked}`).then(r => (r.ok ? r.json() : null)).catch(() => null),
+      ]);
+      if (this.destroyed || !m) return;
+      if (activity) this.onActivity?.((activity.events || []).sort((a, b) => a.timestamp - b.timestamp));
+      const oldEnd = this.manifest.end;
+      const following = this.atLiveEdge();
+      // rrweb's playback timer stops once it runs out of events, while the
+      // player still reports "playing" (and doesn't always fire "finish"):
+      // a playhead that hasn't moved since the last poll has stalled there.
+      const stalled = this.finished || this.now === this.lastPollNow;
+      this.lastPollNow = this.now;
+      this.manifest = m;
+      if (m.end > oldEnd && following && !this.loading) {
+        // Fetch the new tail now (not when the playhead nears it): at the
+        // live edge, the player has nothing left to play.
+        const r = this.ranges.find(([a, b]) => a <= oldEnd && oldEnd < b);
+        if (r) {
+          await this.loadForward(r);
+          // Stopped at the old end: carry on from there with the new events.
+          if (stalled && !this.destroyed) this.player.goto(this.now - this.zero, true);
+        }
+      }
+      if (!m.live) clearInterval(this.liveTimer);
+      this.emit();
+    } catch (err) {
+      console.error("live poll failed", err);
+    } finally {
+      this.polling = false;
+    }
   }
 
   createPlayer(offset, play) {
@@ -286,6 +393,7 @@ class ReplayStreamer {
       target: this.mount,
       props: {
         events: [...this.events], width: this.width, height: 480, autoPlay: false,
+        tags: this.tags,
         // rrweb's virtual DOM (used to fast-forward on seek) throws
         // "insertBefore ... node type does not support" when a seek lands on
         // a later FullSnapshot once the first one has rendered; seeking
@@ -297,7 +405,12 @@ class ReplayStreamer {
     // The replayer keeps its own copy of the event array; jumps insert into
     // it directly (see insertBehindPlayhead).
     this.replayerEvents = player.getReplayer?.()?.service?.state?.context?.events || null;
-    player.addEventListener("ui-update-player-state", e => { this.playing = e.payload === "playing"; });
+    player.addEventListener("ui-update-player-state", e => {
+      this.playing = e.payload === "playing";
+      if (this.playing) this.finished = false;
+    });
+    // Reached the end of what is loaded (a live session's newest event).
+    player.addEventListener("finish", () => { this.finished = true; });
     player.addEventListener("ui-update-current-time", e => this.onTime(this.zero + e.payload));
     if (offset || play) player.goto(offset, play);
   }
@@ -330,6 +443,9 @@ class ReplayStreamer {
 
   emit() {
     this.onState?.({
+      live: !!this.manifest?.live,
+      atLiveEdge: !!this.manifest && this.atLiveEdge(),
+      end: this.manifest?.end,
       ranges: this.ranges.map(r => [...r]),
       buffering: this.buffering,
       failed: this.failed,
@@ -364,6 +480,7 @@ class ReplayStreamer {
       })
       .catch(err => { console.error("replay prefetch failed", err); this.fail(); })
       .finally(() => { this.loading = null; this.emit(); });
+    return this.loading;
   }
 
   // Load around t (from its keyframe) and resume there.
@@ -416,29 +533,33 @@ class ReplayStreamer {
     this.failTimer = setTimeout(() => { this.failed = false; this.emit(); }, 4000);
   }
 
-  seekAbs(t) {
+  seekAbs(t, play = this.playing) {
     if (!this.manifest) return;
     t = Math.max(this.manifest.start, Math.min(t, this.manifest.end));
-    if (this.rangeAt(t)) this.player.goto(t - this.zero, this.playing);
-    else if (!this.loading) this.jumpTo(t, this.playing);
+    if (this.rangeAt(t)) this.player.goto(t - this.zero, play);
+    else if (!this.loading) this.jumpTo(t, play);
   }
 
   destroy() {
     this.destroyed = true;
     clearTimeout(this.failTimer);
+    clearInterval(this.liveTimer);
     this.player?.$destroy?.();
     this.player = null;
     this.listeners.clear();
   }
 }
 
-function SessionReplay({ sessionId, playerApiRef, onTime, onManifest }) {
+function SessionReplay({ sessionId, playerApiRef, onTime, onManifest, onActivity }) {
   const wrapperRef = useRef(null); // always visible, safe to measure for width
   const containerRef = useRef(null); // hidden until ready, clientWidth would read 0
   const [status, setStatus] = useState("loading"); // loading | ready | empty | error
   const [errorMessage, setErrorMessage] = useState("");
-  const [stream, setStream] = useState({ ranges: [], buffering: false, loadedEvents: 0 });
+  const [stream, setStream] = useState({ ranges: [], buffering: false, loadedEvents: 0, live: false });
   const [manifest, setManifest] = useState(null);
+  const [markerCounts, setMarkerCounts] = useState({});
+  const [copied, setCopied] = useState(false);
+  const streamerRef = useRef(null);
   // Defaults to masked - the server stores a redacted copy of every session
   // alongside the raw one (see backend/internal/masking) and serves that by
   // default; flipping this re-fetches the raw, unmasked copy instead.
@@ -448,24 +569,30 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest }) {
     let cancelled = false;
     setStatus("loading");
     setManifest(null);
+    setMarkerCounts({});
     const streamer = new ReplayStreamer({
       sessionId, masked, mount: containerRef.current,
       width: wrapperRef.current.clientWidth,
       onState: s => { if (!cancelled) setStream(s); },
     });
     streamer.listeners.add(t => onTime?.(t));
+    streamer.onActivity = a => { if (!cancelled) onActivity?.(a); }; // live refreshes
+    streamerRef.current = streamer;
 
     streamer.start().then(r => {
       if (cancelled) return;
       if (r.empty) {
+        onActivity?.(streamer.activity || []);
         setErrorMessage(r.empty);
         setStatus("empty");
         return;
       }
+      if (playerApiRef) playerApiRef.current = { seek: t => streamer.seekAbs(t), now: () => streamer.now };
       setManifest(r.manifest);
       onManifest?.(r.manifest);
+      onActivity?.(r.activity);
+      setMarkerCounts(countBy(streamer.markers || [], k => k.kind));
       streamer.emit();
-      if (playerApiRef) playerApiRef.current = { seek: t => streamer.seekAbs(t) };
       setStatus("ready");
     }).catch(e => {
       if (cancelled) return;
@@ -482,11 +609,43 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest }) {
     };
   }, [sessionId, masked]);
 
-  const span = manifest ? Math.max(1, manifest.end - manifest.start) : 1;
+  // The manifest grows while a session is live; the stream state has the
+  // latest end.
+  const end = stream.end ?? manifest?.end;
+  const span = manifest ? Math.max(1, end - manifest.start) : 1;
 
   return (
     <div ref={wrapperRef} style={{ position: "relative" }}>
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginBottom: 8 }}>
+        {status === "ready" && manifest && (
+          <button
+            onClick={async () => {
+              const now = streamerRef.current?.now ?? manifest.start;
+              const link = sessionLink(sessionId, (now - manifest.start) / 1000);
+              try { await navigator.clipboard.writeText(link); } catch { window.prompt("Copy this link", link); return; }
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            }}
+            title="Copy a link that opens this session at the current moment"
+            style={{
+              padding: "5px 12px", borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: "pointer",
+              border: `1px solid ${C.borderStrong}`, background: "transparent", color: C.textMuted,
+            }}
+          >
+            {copied ? "✓ Link copied" : "🔗 Copy link at this moment"}
+          </button>
+        )}
+        {manifest?.device_masked ? (
+          // Mobile: pixels were masked on the phone before upload, so there
+          // is no unmasked copy to switch to.
+          <span title="Masked on the device before upload (mobile recording). There is no unmasked copy." style={{
+            display: "flex", alignItems: "center", gap: 6,
+            padding: "5px 12px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+            border: `1px solid ${C.border}`, color: C.textMuted,
+          }}>
+            <span>🔒</span>Masked on device
+          </span>
+        ) : (
         <button
           onClick={() => setMasked(m => !m)}
           title={masked
@@ -503,6 +662,7 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest }) {
           <span>{masked ? "🔒" : "🔓"}</span>
           {masked ? "Masked" : "Unmasked"}
         </button>
+        )}
       </div>
       {/* Status overlay: a sibling React fully owns. It's never the same node
           rrweb-player writes into, so React and the player never fight over
@@ -550,13 +710,42 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest }) {
               <div key={i} style={{
                 position: "absolute", top: 0, bottom: 0, background: C.textFaint,
                 left: `${((a - manifest.start) / span) * 100}%`,
-                width: `${(Math.min(b, manifest.end + 1) - a) / span * 100}%`,
+                width: `${(Math.min(b, end + 1) - a) / span * 100}%`,
               }} />
             ))}
           </div>
-          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 10, color: C.textFaint }}>
-            <span>Streaming · {stream.loadedEvents} of {manifest.events} events loaded</span>
-            <span>{manifest.keyframes.length} keyframe{manifest.keyframes.length === 1 ? "" : "s"}</span>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginTop: 4, fontSize: 10, color: C.textFaint }}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              {stream.live && (
+                // Live session: jump to the newest moment and follow it.
+                <button
+                  onClick={() => streamerRef.current?.goLive()}
+                  title={stream.atLiveEdge ? "Watching live" : "Jump to the newest moment and follow it"}
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 5,
+                    padding: "1px 8px", borderRadius: 10, fontSize: 10, fontWeight: 700, letterSpacing: "0.04em",
+                    cursor: "pointer", border: `1px solid ${C.ink}`,
+                    background: stream.atLiveEdge ? C.ink : "transparent",
+                    color: stream.atLiveEdge ? "#fff" : C.ink,
+                  }}
+                >
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: stream.atLiveEdge ? "#fff" : C.ink, animation: "pulse 1.4s infinite" }} />
+                  {stream.atLiveEdge ? "LIVE" : "GO LIVE"}
+                </button>
+              )}
+              Streaming · {stream.loadedEvents} events loaded · {manifest.keyframes.length} keyframe{manifest.keyframes.length === 1 ? "" : "s"}
+            </span>
+            {/* Legend for the ticks rrweb-player draws on its scrubber. */}
+            <span style={{ display: "flex", gap: 10 }}>
+              {[["error", "errors"], ["network", "failed requests"], ["rage", "rage clicks"]]
+                .filter(([k]) => markerCounts[k])
+                .map(([k, label]) => (
+                  <span key={k} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                    <span style={{ width: 3, height: 9, borderRadius: 1, background: MARKER_COLORS[k] }} />
+                    {markerCounts[k]} {label}
+                  </span>
+                ))}
+            </span>
           </div>
         </div>
       )}
@@ -580,9 +769,15 @@ function buildActivity(events, sessionStart) {
   let lastHref = null;
   for (const e of events) {
     const ts = e.timestamp, at = ts - start;
-    if (e.type === 4 && e.data?.href && e.data.href !== lastHref) {
-      lastHref = e.data.href;
-      behaviour.push({ ts, at, kind: "navigate", label: "Navigate", detail: e.data.href });
+    // Page/screen changes come from Meta events and from app-reported
+    // navigations (mobile companion); show each change once.
+    const href = e.type === 4 ? e.data?.href : e.type === 5 && e.subtype === "navigate" ? e.url : null;
+    if (href) {
+      const key = href.replace(/\/+$/, "");
+      if (key !== lastHref) {
+        lastHref = key;
+        behaviour.push({ ts, at, kind: "navigate", label: "Navigate", detail: href });
+      }
       continue;
     }
     if (e.type !== 5) continue;
@@ -597,13 +792,16 @@ function buildActivity(events, sessionStart) {
         behaviour.push({ ts, at, kind: "input", label: "Input", detail: e.selector });
         break;
       case "console":
-        consoleLogs.push({ ts, at, level: e.level || "log", message: e.message });
+        consoleLogs.push({ ts, at, level: e.level || "log", message: e.message, stack: e.stack });
         break;
       case "js_error":
-        consoleLogs.push({ ts, at, level: "exception", message: e.message });
+        consoleLogs.push({
+          ts, at, level: "exception", message: e.message, stack: e.stack,
+          source: e.filename ? `${shortUrl(e.filename)}${e.lineno ? `:${e.lineno}` : ""}${e.colno ? `:${e.colno}` : ""}` : null,
+        });
         break;
       case "network":
-        network.push({ ts, at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration });
+        network.push({ ts, at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration, error: e.error });
         break;
     }
   }
@@ -716,11 +914,24 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
                     </>}
                     {tab === "console" && <>
                       <td style={{ ...cell, width: 80, fontWeight: isError ? 700 : 600, color: isError ? C.text : C.textMuted, textTransform: "uppercase", fontSize: 10, letterSpacing: "0.04em" }}>{r.level}</td>
-                      <td style={{ ...cell, ...mono, color: C.text, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{r.message}</td>
+                      <td style={{ ...cell, ...mono, color: C.text, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                        {r.message}
+                        {r.source && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>at {r.source}</div>}
+                        {r.stack && (
+                          // Clicking the stack toggles it; it must not also seek.
+                          <details onClick={e => e.stopPropagation()} style={{ marginTop: 4 }}>
+                            <summary style={{ fontSize: 11, color: C.textMuted, cursor: "pointer" }}>Stack trace</summary>
+                            <pre style={{ ...mono, fontSize: 11, color: C.textMuted, whiteSpace: "pre-wrap", margin: "4px 0 0", maxHeight: 200, overflow: "auto" }}>{r.stack}</pre>
+                          </details>
+                        )}
+                      </td>
                     </>}
                     {tab === "network" && <>
                       <td style={{ ...cell, ...mono, width: 60, fontWeight: 600, color: C.text }}>{r.method}</td>
-                      <td title={r.url} style={{ ...cell, ...mono, color: C.textMuted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.url}</td>
+                      <td title={r.url} style={{ ...cell, ...mono, color: C.textMuted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {r.url}
+                        {r.error && <div style={{ fontSize: 11, color: C.text, whiteSpace: "normal" }}>{r.error}</div>}
+                      </td>
                       <td style={{ ...cell, ...mono, width: 60, textAlign: "right", fontWeight: isError ? 700 : 500, color: isError ? C.text : C.textMuted }}>{r.status || "failed"}</td>
                       <td style={{ ...cell, ...mono, width: 70, textAlign: "right", color: C.textFaint }}>{r.duration == null ? "—" : r.duration === 0 ? "0ms" : dur(r.duration)}</td>
                     </>}
@@ -737,26 +948,74 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
 
 // ── Session Detail ────────────────────────────────────────────────────────────
 
-function SessionDetail({ session, onAnalyze, onCreateJira }) {
+// A "▶ 00:19" button that jumps the replay to a finding's moment.
+function JumpButton({ ts, start, source, onSeek }) {
+  if (!ts) return null;
+  return (
+    <button
+      onClick={() => onSeek(ts)}
+      title={source === "matched"
+        ? "Jump the replay here (matched from the session's events)"
+        : "Jump the replay to this moment"}
+      style={{
+        flex: "0 0 auto", padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        border: `1px solid ${C.borderStrong}`, background: C.bg, color: C.text, cursor: "pointer",
+      }}
+    >
+      ▶ {start != null ? clock(ts - start) : "play"}{source === "matched" ? " ≈" : ""}
+    </button>
+  );
+}
+
+function SessionDetail({ session, onAnalyze, onCreateJira, pendingSeek, onSeekDone }) {
   const [loading, setLoading] = useState(false);
   const [activityEvents, setActivityEvents] = useState(null);
   const [replayStart, setReplayStart] = useState(null);
   const [currentTime, setCurrentTime] = useState(null); // absolute ms
+  const [moments, setMoments] = useState(null);
   const playerApiRef = useRef(null);
-  // The activity tabs read a light feed (navigation + SDK-tagged events
-  // only), independent of how much of the replay has streamed in.
+  const replayRef = useRef(null);
+  // The activity tabs read the light activity feed (navigation + SDK-tagged
+  // events), which the replay loads alongside its manifest.
   useEffect(() => {
-    let cancelled = false;
     setActivityEvents(null);
     setReplayStart(null);
     setCurrentTime(null);
-    fetch(`${API}/api/v1/sessions/${session.session_id}/replay/activity`)
-      .then(r => (r.ok ? r.json() : { events: [] }))
-      .then(d => { if (!cancelled) setActivityEvents((d.events || []).sort((a, b) => a.timestamp - b.timestamp)); })
-      .catch(() => { if (!cancelled) setActivityEvents([]); });
-    return () => { cancelled = true; };
   }, [session.session_id]);
   const analyzed = session.ai_status === "complete" && session.ai_summary;
+
+  // When each AI finding happened, for the jump buttons.
+  useEffect(() => {
+    let cancelled = false;
+    setMoments(null);
+    if (!analyzed) return;
+    fetch(`${API}/api/v1/sessions/${session.session_id}/moments`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (!cancelled) setMoments(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [session.session_id, analyzed]);
+
+  const seek = ts => {
+    playerApiRef.current?.seek(ts);
+    replayRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  // Deep links and "open replay" from the Issues tab: seek once the replay
+  // (and, for an issue, its moment) is known.
+  useEffect(() => {
+    if (!pendingSeek || replayStart == null || !playerApiRef.current) return;
+    let ts = null;
+    if (pendingSeek.kind === "offset") ts = replayStart + pendingSeek.sec * 1000;
+    else if (pendingSeek.kind === "abs") ts = pendingSeek.ts;
+    else if (pendingSeek.kind === "issue") {
+      if (!moments && analyzed) return; // wait for moments
+      ts = moments?.issues?.find(m => m.id === pendingSeek.id)?.ts || null;
+    }
+    if (ts) seek(ts);
+    onSeekDone?.();
+  }, [pendingSeek, replayStart, moments, analyzed]);
 
   const handleAnalyze = async () => {
     setLoading(true);
@@ -832,9 +1091,26 @@ function SessionDetail({ session, onAnalyze, onCreateJira }) {
           {session.ai_frustrations?.length > 0 && (
             <div style={{ background: C.bgSubtle, borderRadius: 8, padding: 16, border: `1px solid ${C.border}`, marginBottom: 12 }}>
               <div style={{ fontSize: 11, color: C.text, marginBottom: 10, fontWeight: 700 }}>FRUSTRATIONS DETECTED</div>
-              {session.ai_frustrations.map((f, i) => (
-                <div key={i} style={{ fontSize: 12, color: C.textMuted, marginBottom: 6, paddingLeft: 12, borderLeft: `2px solid ${C.ink}` }}>
-                  {f}
+              {session.ai_frustrations.map((f, i) => {
+                const m = moments?.frustrations?.[i];
+                return (
+                  <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", justifyContent: "space-between", fontSize: 12, color: C.textMuted, marginBottom: 6, paddingLeft: 12, borderLeft: `2px solid ${C.ink}` }}>
+                    <span>{f}</span>
+                    <JumpButton ts={m?.ts} source={m?.source} start={replayStart} onSeek={seek} />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* This session's issues, with where they happened */}
+          {moments?.issues?.length > 0 && (
+            <div style={{ background: C.bgSubtle, borderRadius: 8, padding: 16, border: `1px solid ${C.border}`, marginBottom: 12 }}>
+              <div style={{ fontSize: 11, color: C.text, marginBottom: 10, fontWeight: 700 }}>ISSUES</div>
+              {moments.issues.map(m => (
+                <div key={m.id} style={{ display: "flex", gap: 8, alignItems: "flex-start", justifyContent: "space-between", fontSize: 12, color: C.textMuted, marginBottom: 6, paddingLeft: 12, borderLeft: `2px solid ${C.borderStrong}` }}>
+                  <span>{m.text}</span>
+                  <JumpButton ts={m.ts} source={m.source} start={replayStart} onSeek={seek} />
                 </div>
               ))}
             </div>
@@ -861,11 +1137,12 @@ function SessionDetail({ session, onAnalyze, onCreateJira }) {
       )}
 
       {/* Session Replay */}
-      <div>
+      <div ref={replayRef} style={{ scrollMarginTop: 12 }}>
         <SectionHeader>Session Replay</SectionHeader>
         <SessionReplay
           sessionId={session.session_id}
           onManifest={m => setReplayStart(m.start)}
+          onActivity={setActivityEvents}
           onTime={setCurrentTime}
           playerApiRef={playerApiRef}
         />
@@ -882,7 +1159,7 @@ function SessionDetail({ session, onAnalyze, onCreateJira }) {
 
 // ── Issues Panel ──────────────────────────────────────────────────────────────
 
-function IssuesPanel({ issues, onCreateJira }) {
+function IssuesPanel({ issues, onCreateJira, onOpenIssue }) {
   return (
     <div style={{ height: "100%", overflowY: "auto", padding: "24px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
@@ -938,8 +1215,14 @@ function IssuesPanel({ issues, onCreateJira }) {
                 {issue.tags?.map(t => <Tag key={t} label={t} />)}
               </div>
               {issue.session_id && (
-                <div style={{ marginTop: 8, fontSize: 11, color: C.textFaint }}>
-                  Session: <span style={{ color: C.textMuted, fontFamily: "monospace" }}>{issue.session_id.slice(0, 8)}</span>
+                <div style={{ marginTop: 8, fontSize: 11, color: C.textFaint, display: "flex", alignItems: "center", gap: 10 }}>
+                  <span>Session: <span style={{ color: C.textMuted, fontFamily: "monospace" }}>{issue.session_id.slice(0, 8)}</span></span>
+                  <button onClick={() => onOpenIssue?.(issue)} style={{
+                    fontSize: 11, padding: "2px 10px", borderRadius: 10, fontWeight: 600,
+                    border: `1px solid ${C.borderStrong}`, background: "transparent", color: C.text, cursor: "pointer",
+                  }}>
+                    ▶ Watch in replay
+                  </button>
                 </div>
               )}
             </div>
@@ -1012,10 +1295,34 @@ function SectionHeader({ children }) {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+// Deep link: ?session=<id>&t=<seconds from the start of the replay>.
+function readDeepLink() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const t = Number(q.get("t"));
+    return { session: q.get("session"), t: Number.isFinite(t) && t > 0 ? t : null };
+  } catch {
+    return { session: null, t: null };
+  }
+}
+
+function sessionLink(sessionId, offsetSec) {
+  const u = new URL(window.location.href);
+  u.search = "";
+  u.searchParams.set("session", sessionId);
+  if (offsetSec > 0) u.searchParams.set("t", String(Math.floor(offsetSec)));
+  return u.toString();
+}
+
 export default function App() {
+  const deepLink = useRef(readDeepLink()).current;
   const [sessions, setSessions] = useState([]);
   const [issues, setIssues] = useState([]);
-  const [selectedSessionId, setSelectedSessionId] = useState(null);
+  const [selectedSessionId, setSelectedSessionId] = useState(deepLink.session);
+  // Where to put the playhead once the selected session's replay is ready.
+  const [pendingSeek, setPendingSeek] = useState(deepLink.t ? { kind: "offset", sec: deepLink.t } : null);
+  // A linked session that isn't in the loaded list (older than the first page).
+  const [linkedSession, setLinkedSession] = useState(null);
   const [activeTab, setActiveTab] = useState("sessions"); // sessions | issues | stream
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
@@ -1121,10 +1428,42 @@ export default function App() {
   // Look up the live session object by id on every render, rather than
   // holding a frozen snapshot, so the detail panel reflects AI pipeline
   // progress as fetchSessions() polls in fresh data.
-  const selectedSession =
+  const listedSession =
     sessions.find(s => s.session_id === selectedSessionId) ||
     displayedSessions.find(s => s.session_id === selectedSessionId) ||
     null;
+  const selectedSession = listedSession ||
+    (linkedSession?.session_id === selectedSessionId ? linkedSession : null);
+
+  // Keep the address bar pointing at the open session, so it can be shared.
+  useEffect(() => {
+    try {
+      const url = selectedSessionId ? sessionLink(selectedSessionId, pendingSeek?.kind === "offset" ? pendingSeek.sec : 0) : window.location.pathname;
+      window.history.replaceState(null, "", url);
+    } catch { /* non-browser or sandboxed */ }
+  }, [selectedSessionId]);
+
+  // Fetch a linked session that the first page of the list doesn't include.
+  useEffect(() => {
+    if (!selectedSessionId || listedSession || loading || linkedSession?.session_id === selectedSessionId) return;
+    let cancelled = false;
+    fetch(`${API}/api/v1/sessions/${selectedSessionId}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(s => { if (!cancelled && s) setLinkedSession({ ...s, session_id: s.session_id || s.id }); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedSessionId, listedSession, loading]);
+
+  const selectSession = id => {
+    setPendingSeek(null);
+    setSelectedSessionId(id);
+  };
+
+  const openIssue = issue => {
+    setActiveTab("sessions");
+    setSelectedSessionId(issue.session_id);
+    setPendingSeek(issue.moment_ts ? { kind: "abs", ts: issue.moment_ts } : { kind: "issue", id: issue.id });
+  };
 
   return (
     <div style={{
@@ -1245,7 +1584,7 @@ export default function App() {
                   key={s.session_id}
                   session={s}
                   selected={selectedSessionId === s.session_id}
-                  onClick={() => setSelectedSessionId(s.session_id)}
+                  onClick={() => selectSession(s.session_id)}
                 />
               ))
             )}
@@ -1256,11 +1595,17 @@ export default function App() {
         <div style={{ flex: 1, overflow: "hidden" }}>
           {activeTab === "sessions" && (
             selectedSession
-              ? <SessionDetail session={selectedSession} onAnalyze={handleAnalyze} onCreateJira={handleCreateJira} />
+              ? <SessionDetail
+                  session={selectedSession}
+                  onAnalyze={handleAnalyze}
+                  onCreateJira={handleCreateJira}
+                  pendingSeek={pendingSeek}
+                  onSeekDone={() => setPendingSeek(null)}
+                />
               : <EmptyState />
           )}
           {activeTab === "issues" && (
-            <IssuesPanel issues={issues} onCreateJira={handleCreateJira} />
+            <IssuesPanel issues={issues} onCreateJira={handleCreateJira} onOpenIssue={openIssue} />
           )}
           {activeTab === "stream" && (
             <StreamFeed sessions={sessions} />

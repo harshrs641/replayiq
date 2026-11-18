@@ -161,6 +161,7 @@ func (a *Analyzer) Analyze(ctx context.Context, sessionID string) error {
 			Description: detected.Description,
 			Severity:    detected.Severity,
 			Tags:        detected.Tags,
+			MomentTS:    detected.MomentTS,
 		}
 		if err := a.db.CreateIssue(ctx, issue); err != nil {
 			slog.Error("create issue failed", "error", err)

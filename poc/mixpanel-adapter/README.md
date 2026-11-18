@@ -96,9 +96,26 @@ local-network settings above.
 Note: `flutter_poc/` was written against the SDK's exported API but **not compiled** in
 the environment that created it. Expect to fix a typo or two.
 
-Then in the app: type a name, tap **Pay now** 3-4 times quickly (rage tap), open
-**Order summary**, scroll, go back, and either tap **Flush now** or send the app to the
-background. After ~`SESSION_IDLE_MS` the adapter ends the session.
+Then in the app: type a name, tap **Pay now** 3-4 times quickly (rage tap), tap **Load prices
+(fails)** and **Apply coupon (throws)**, open **Order summary**, scroll, go back, and either tap
+**Flush now** or send the app to the background. After ~`SESSION_IDLE_MS` the adapter ends the
+session.
+
+### Console, network, errors and navigation (companion)
+
+The Mixpanel SDK records only the screen. `flutter_poc/lib/replayiq_companion.dart` records what
+the app does, in the web SDK's event shapes, tagged with the SDK's `replayId`, and posts it to the
+adapter's `POST /riq/events` (same token auth as `/record`), which adds it to the same session:
+
+| Hook | Records |
+|---|---|
+| `navigatorObservers: [companion.navigatorObserver]` | screen changes as `app://flutter/<route name>` |
+| `companion.httpClient()` | method, URL, status, duration; status 0 plus the error when there is no response |
+| `companion.installErrorHandlers()` | `FlutterError.onError` and uncaught async errors, with stack and first app frame |
+| `companion.runCapturingPrints(() => runApp(...))` | `print`/`debugPrint` lines (skips the SDK's own logs and Flutter's printed error reports) |
+
+Unlike the screenshots, this text is not masked on the phone; ReplayIQ redacts PII patterns in
+these fields on ingest (`masking.MaskTextFields`).
 
 ## 6. What to check
 
@@ -107,13 +124,15 @@ background. After ~`SESSION_IDLE_MS` the adapter ends the session.
   portrait phone-screen slideshow with touch indicators.
 - AI summary: should mention taps on `button:"Pay now"` and a rage click. Analysis is skipped
   for sessions under 5 s or 5 events (see `pipeline/analyze.go`).
-- Card field: masked in the screenshot (`MixpanelMask`).
+- Card field: shown as dots (`obscureText`).
+- Behaviour / Console / Network tabs: the screens, the 404 from **Load prices**, the error from
+  **Apply coupon** (with `main.dart` line and stack) and the app's log lines.
 
 ## Known limits of this POC
 
-- **No navigation, network or crash events.** The Mixpanel SDK does not report them, so the AI
-  only sees taps and rage taps. Next step is a small companion (NavigatorObserver, http wrapper,
-  FlutterError hook) that posts ReplayIQ `navigate` / `network` / `js_error` events.
+- **Companion coverage:** only requests made through `companion.httpClient()` are recorded (not
+  other `HttpClient`s or plugins' native networking), and navigation only for named routes reads
+  well (unnamed ones show as `app://flutter/`).
 - **Privacy:** pixels are masked on the device; ReplayIQ's server-side masking cannot redact
   pixels, and the raw bucket stores batches unmasked. Default SDK masking hides all text, which
   also blanks the wireframe labels; the demo unmasks text to make the AI output readable. Decide

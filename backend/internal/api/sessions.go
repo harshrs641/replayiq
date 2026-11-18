@@ -17,6 +17,7 @@ const (
 	actionEnd     = "end"
 	actionAnalyze = "analyze"
 	actionReplay  = "replay"
+	actionMoments = "moments"
 )
 
 // POST /api/v1/sessions — create session
@@ -79,6 +80,8 @@ func (r *router) handleSessionByID(w http.ResponseWriter, req *http.Request) {
 		r.endSession(w, req, sessionID)
 	case actionAnalyze:
 		r.triggerAnalysis(w, req, sessionID)
+	case actionMoments:
+		r.sessionMoments(w, req, sessionID)
 	case actionReplay:
 		if len(parts) == 3 && parts[2] != "" {
 			r.replayStream(w, req, sessionID, parts[2])
@@ -149,25 +152,43 @@ func (r *router) triggerAnalysis(w http.ResponseWriter, req *http.Request, sessi
 // time, so the handler never holds the full session in memory regardless
 // of session size.
 func (r *router) replaySession(w http.ResponseWriter, req *http.Request, sessionID string) {
-	useRaw := !r.useMaskedCopy(req.Context(), sessionID, req.URL.Query().Get("masked") != "false")
+	src := r.replaySourceFor(req.Context(), sessionID, req.URL.Query().Get("masked") != "false")
 	ctx := req.Context()
 
 	w.Header().Set("Content-Type", "application/json")
+	w, done := withGzip(w, req)
+	defer done()
 	w.WriteHeader(http.StatusOK)
 
-	maskedVal := "true"
-	if useRaw {
-		maskedVal = "false"
-	}
-	fmt.Fprintf(w, `{"session_id":%q,"masked":%s,"batches":[`, sessionID, maskedVal)
+	fmt.Fprintf(w, `{"session_id":%q,"masked":%t,"device_masked":%t,"batches":[`, sessionID, src.Masked(), src.DeviceMasked)
 
-	if useRaw {
-		r.cfg.MinIO.StreamSessionEvents(ctx, sessionID, w)
-	} else {
+	if src.MaskedBucket {
 		r.cfg.MinIO.StreamSessionMaskedEvents(ctx, sessionID, w)
+	} else {
+		r.cfg.MinIO.StreamSessionEvents(ctx, sessionID, w)
 	}
 
 	fmt.Fprint(w, "]}")
+}
+
+// replaySource says which stored copy a replay request is served from.
+type replaySource struct {
+	// MaskedBucket: serve the server-masked copy (else the raw bucket).
+	MaskedBucket bool
+	// DeviceMasked: the recorder masked the session on the device, so the
+	// single raw copy is already the masked view.
+	DeviceMasked bool
+}
+
+// Masked reports whether what is served is masked.
+func (s replaySource) Masked() bool { return s.MaskedBucket || s.DeviceMasked }
+
+func (r *router) replaySourceFor(ctx context.Context, sessionID string, masked bool) replaySource {
+	if masked && !r.cfg.MinIO.HasMaskedEvents(ctx, sessionID) && r.cfg.MinIO.IsDeviceMasked(ctx, sessionID) {
+		// No masked copy is ever written for these; don't wait for one.
+		return replaySource{DeviceMasked: true}
+	}
+	return replaySource{MaskedBucket: r.useMaskedCopy(ctx, sessionID, masked)}
 }
 
 // useMaskedCopy reports whether the replay should be served from the masked

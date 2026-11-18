@@ -13,10 +13,30 @@
 import 'package:flutter/material.dart';
 import 'package:mixpanel_flutter_session_replay/mixpanel_flutter_session_replay.dart';
 
+import 'replayiq_companion.dart';
+
 const String riqUrl = String.fromEnvironment('RIQ_URL');
 const String riqProject = String.fromEnvironment('RIQ_PROJECT', defaultValue: 'demo');
 
-void main() => runApp(const PocApp());
+/// The running replay SDK instance (set once initialized).
+MixpanelSessionReplay? replayInstance;
+
+/// Records navigation, HTTP calls, errors and logs into the same ReplayIQ
+/// session as the screenshots (see replayiq_companion.dart).
+final companion = ReplayIQCompanion(
+  adapterUrl: riqUrl,
+  token: riqProject,
+  distinctId: 'poc_user_1',
+  replayId: () => replayInstance?.replayId,
+);
+
+/// Use for the app's API calls so they show in the Network tab.
+final apiClient = companion.httpClient();
+
+void main() {
+  companion.installErrorHandlers();
+  companion.runCapturingPrints(() => runApp(const PocApp()));
+}
 
 class PocApp extends StatefulWidget {
   const PocApp({super.key});
@@ -64,6 +84,8 @@ class _PocAppState extends State<PocApp> {
     setState(() {
       if (result.success) {
         _replay = result.instance;
+        replayInstance = result.instance;
+        print('Checkout opened'); // shows in the Console tab
         _status = 'recording -> $riqUrl';
       } else {
         _status = 'init failed: ${result.errorMessage}';
@@ -76,6 +98,7 @@ class _PocAppState extends State<PocApp> {
     return MixpanelSessionReplayWidget(
       instance: _replay,
       child: MaterialApp(
+        navigatorObservers: [companion.navigatorObserver],
         title: 'ReplayIQ mobile POC',
         theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
         home: CheckoutScreen(status: _status, replay: _replay),
@@ -113,13 +136,34 @@ class CheckoutScreen extends StatelessWidget {
           const SizedBox(height: 12),
           OutlinedButton(
             onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => const SummaryScreen()),
+              MaterialPageRoute<void>(
+                settings: const RouteSettings(name: '/order-summary'),
+                builder: (_) => const SummaryScreen(),
+              ),
             ),
             child: const Text('Order summary'),
           ),
           const SizedBox(height: 12),
+          // Network tab: this path doesn't exist on the adapter, so it's a 404.
+          OutlinedButton(
+            onPressed: () async {
+              final res = await apiClient.get(Uri.parse('$riqUrl/demo/prices'));
+              print('Prices request returned ${res.statusCode}');
+            },
+            child: const Text('Load prices (fails)'),
+          ),
+          const SizedBox(height: 12),
+          // Console tab + AI analysis: an error thrown in a tap handler.
+          OutlinedButton(
+            onPressed: () => throw StateError('Coupon service returned no discount'),
+            child: const Text('Apply coupon (throws)'),
+          ),
+          const SizedBox(height: 12),
           TextButton(
-            onPressed: () => replay?.flush(),
+            onPressed: () {
+              replay?.flush();
+              companion.flush();
+            },
             child: const Text('Flush now'),
           ),
         ],

@@ -177,15 +177,17 @@ func (p *Postgres) EndSession(ctx context.Context, sessionID string, endedAt tim
 func (p *Postgres) UpdateSessionAI(ctx context.Context, sessionID string, summary *models.SessionSummary) error {
 	tags, _ := json.Marshal(summary.Tags)
 	frustrations, _ := json.Marshal(summary.Frustrations)
+	frustrationTS, _ := json.Marshal(summary.FrustrationTS)
 	tokenized, _ := json.Marshal(summary.TokenizedEvents)
 	now := time.Now()
 	_, err := p.pool.Exec(ctx, `
 		UPDATE sessions SET
 			ai_summary=$1, ai_tokenized=$2, ai_tags=$3,
-			ai_goal_achieved=$4, ai_frustrations=$5, ai_processed_at=$6
+			ai_goal_achieved=$4, ai_frustrations=$5, ai_processed_at=$6,
+			ai_frustration_ts=$8
 		WHERE id=$7`,
 		summary.Narrative, string(tokenized), tags,
-		summary.GoalAchieved, frustrations, now, sessionID,
+		summary.GoalAchieved, frustrations, now, sessionID, frustrationTS,
 	)
 	return err
 }
@@ -358,13 +360,53 @@ func (p *Postgres) ListSessions(ctx context.Context, projectID string, limit, of
 func (p *Postgres) CreateIssue(ctx context.Context, issue *models.AIIssue) error {
 	tags, _ := json.Marshal(issue.Tags)
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ai_issues (id, session_id, project_id, type, title, description, severity, tags, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())`,
+		INSERT INTO ai_issues (id, session_id, project_id, type, title, description, severity, tags, moment_ts, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9, 0),NOW())`,
 		issue.ID, issue.SessionID, issue.ProjectID,
 		issue.Type, issue.Title, issue.Description,
-		issue.Severity, tags,
+		issue.Severity, tags, issue.MomentTS,
 	)
 	return err
+}
+
+// SessionMoments is what grounding a session's AI findings needs.
+type SessionMoments struct {
+	Tokenized     string
+	Frustrations  []string
+	FrustrationTS []int64
+	Issues        []*models.AIIssue
+}
+
+// GetSessionMoments loads a session's AI findings, their stored times (if
+// any) and the tokenized events to ground the ones without.
+func (p *Postgres) GetSessionMoments(ctx context.Context, sessionID string) (*SessionMoments, error) {
+	var out SessionMoments
+	var frustrations, ts []byte
+	err := p.r().QueryRow(ctx, `
+		SELECT COALESCE(ai_tokenized, ''), ai_frustrations, ai_frustration_ts
+		FROM sessions WHERE id=$1`, sessionID,
+	).Scan(&out.Tokenized, &frustrations, &ts)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal(frustrations, &out.Frustrations)
+	json.Unmarshal(ts, &out.FrustrationTS)
+
+	rows, err := p.r().Query(ctx, `
+		SELECT id, title, COALESCE(description, ''), COALESCE(moment_ts, 0)
+		FROM ai_issues WHERE session_id=$1 ORDER BY created_at`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		iss := &models.AIIssue{SessionID: sessionID}
+		if err := rows.Scan(&iss.ID, &iss.Title, &iss.Description, &iss.MomentTS); err != nil {
+			return nil, err
+		}
+		out.Issues = append(out.Issues, iss)
+	}
+	return &out, rows.Err()
 }
 
 func (p *Postgres) UpdateIssueJira(ctx context.Context, issueID, jiraKey, jiraURL string) error {
@@ -377,7 +419,8 @@ func (p *Postgres) UpdateIssueJira(ctx context.Context, issueID, jiraKey, jiraUR
 
 func (p *Postgres) ListIssues(ctx context.Context, projectID string, limit int) ([]*models.AIIssue, error) {
 	rows, err := p.r().Query(ctx, `
-		SELECT id, session_id, project_id, type, title, description, severity, tags, jira_key, jira_url, created_at
+		SELECT id, session_id, project_id, type, title, description, severity, tags,
+			COALESCE(jira_key, ''), COALESCE(jira_url, ''), COALESCE(moment_ts, 0), created_at
 		FROM ai_issues WHERE project_id=$1 ORDER BY created_at DESC LIMIT $2`,
 		projectID, limit,
 	)
@@ -392,7 +435,7 @@ func (p *Postgres) ListIssues(ctx context.Context, projectID string, limit int) 
 		var tags []byte
 		rows.Scan(&iss.ID, &iss.SessionID, &iss.ProjectID, &iss.Type,
 			&iss.Title, &iss.Description, &iss.Severity, &tags,
-			&iss.JiraKey, &iss.JiraURL, &iss.CreatedAt)
+			&iss.JiraKey, &iss.JiraURL, &iss.MomentTS, &iss.CreatedAt)
 		json.Unmarshal(tags, &iss.Tags)
 		issues = append(issues, iss)
 	}
@@ -435,6 +478,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS embedding vector(%d);
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_status TEXT DEFAULT 'pending';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_error TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_frustration_ts JSONB;
 UPDATE sessions SET ai_status = 'complete' WHERE ai_status = 'pending' AND ai_processed_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
@@ -455,6 +499,8 @@ CREATE TABLE IF NOT EXISTS ai_issues (
 	jira_url    TEXT,
 	created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE ai_issues ADD COLUMN IF NOT EXISTS moment_ts BIGINT;
 
 CREATE INDEX IF NOT EXISTS idx_issues_project ON ai_issues(project_id);
 CREATE INDEX IF NOT EXISTS idx_issues_session ON ai_issues(session_id);
@@ -580,8 +626,12 @@ func (m *MinIO) store(ctx context.Context, bucket, sessionID string, batch *mode
 	for i, e := range batch.Events {
 		headers[i] = eventHeader{Type: e.Type, Timestamp: e.Timestamp, Subtype: e.Subtype}
 	}
+	md := indexEvents(headers).toMetadata()
+	if batch.DeviceMasked {
+		md[metaDeviceMasked] = "1"
+	}
 	_, err := m.client.PutObject(ctx, bucket, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()),
-		minio.PutObjectOptions{ContentType: "application/gzip", UserMetadata: indexEvents(headers).toMetadata()},
+		minio.PutObjectOptions{ContentType: "application/gzip", UserMetadata: md},
 	)
 	return key, err
 }
