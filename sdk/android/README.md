@@ -1,5 +1,7 @@
 # ReplayIQ Android SDK
 
+> How it records, what it sends and how a recording replays: [RECORDING.md](RECORDING.md).
+
 Session replay for native Android apps (Views and Jetpack Compose). It records masked screenshots,
 touches, screens, clicks, rage clicks, text-field edits (never the values), console lines, network
 requests and crashes, and sends them to ReplayIQ using the

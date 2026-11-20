@@ -1,5 +1,7 @@
 # @replayiq/react-native
 
+> How it records, what it sends and how a recording replays: [RECORDING.md](RECORDING.md).
+
 Session replay, touches, network, crashes and JS errors for React Native
 apps, sent to [ReplayIQ](https://github.com/harshrs641/replayiq).
 

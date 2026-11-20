@@ -176,7 +176,7 @@ import ReplayIQ from '@replayiq/web';
 ReplayIQ.init({ endpoint: 'https://your-replayiq-host', key: 'your-ingest-key' });
 ```
 
-The package (source in [`sdk/web`](sdk/web)) also ships the script-tag build for CDNs (`https://cdn.jsdelivr.net/npm/@replayiq/web@1/dist/replayiq.min.js`). `npm run build` there regenerates `sdk/replayiq.js`, which this server serves.
+The package (source in [`sdk/web`](sdk/web) · [how it records](sdk/web/RECORDING.md)) also ships the script-tag build for CDNs (`https://cdn.jsdelivr.net/npm/@replayiq/web@1/dist/replayiq.min.js`). `npm run build` there regenerates `sdk/replayiq.js`, which this server serves.
 
 The SDK keeps its own cost on the page low:
 - **Sampling is decided once per session,** before anything is downloaded. A session that isn't sampled never loads rrweb and sends nothing, and a sampled one is recorded on every page it visits.
@@ -187,7 +187,7 @@ The SDK keeps its own cost on the page low:
 
 ### Flutter
 
-[`sdk/flutter`](sdk/flutter) (`replayiq_flutter`): `ReplayIQ.init(key:, endpoint:)` plus `ReplayIQ.navigatorObserver` records masked screenshots, touches, taps, navigation, console, errors and HTTP calls from iOS and Android Flutter apps. See its README for setup and masking.
+[`sdk/flutter`](sdk/flutter) · [how it records](sdk/flutter/RECORDING.md) (`replayiq_flutter`): `ReplayIQ.init(key:, endpoint:)` plus `ReplayIQ.navigatorObserver` records masked screenshots, touches, taps, navigation, console, errors and HTTP calls from iOS and Android Flutter apps. See its README for setup and masking.
 
 ### How recordings reach storage
 
@@ -199,13 +199,13 @@ The ingest API only checks and accepts a batch (or answers 503 so the SDK retrie
 
 ### SDKs
 
-| Platform | Package | Records |
+| Platform | Package | Records (details: each SDK's `RECORDING.md`) |
 |---|---|---|
 | Web | [`sdk/web`](sdk/web) (`@replayiq/web`) | rrweb DOM, clicks, inputs, console, network, errors |
 | Flutter | [`sdk/flutter`](sdk/flutter) (`replayiq_flutter`) | Native DOM (or screenshots), touches, navigation, HTTP, errors |
-| iOS (Swift) | [`sdk/ios`](sdk/ios) (`ReplayIQ`) | Native DOM from the layer tree (or screenshots), touches, URLSession, crashes |
-| Android (Kotlin) | [`sdk/android`](sdk/android) (`com.replayiq:replayiq`) | Native DOM from the View tree / Compose (or screenshots), touches, OkHttp, crashes |
-| React Native | [`sdk/react-native`](sdk/react-native) (`@replayiq/react-native`) | Wraps the iOS and Android SDKs, plus JS errors, console and React Navigation screens |
+| iOS (Swift) | [`sdk/ios`](sdk/ios) · [how it records](sdk/ios/RECORDING.md) (`ReplayIQ`) | Native DOM from the layer tree (or screenshots), touches, URLSession, crashes |
+| Android (Kotlin) | [`sdk/android`](sdk/android) · [how it records](sdk/android/RECORDING.md) (`com.replayiq:replayiq`) | Native DOM from the View tree / Compose (or screenshots), touches, OkHttp, crashes |
+| React Native | [`sdk/react-native`](sdk/react-native) · [how it records](sdk/react-native/RECORDING.md) (`@replayiq/react-native`) | Wraps the iOS and Android SDKs, plus JS errors, console and React Navigation screens |
 
 ### Building an SDK for another platform
 

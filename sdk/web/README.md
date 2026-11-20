@@ -1,5 +1,7 @@
 # @replayiq/web
 
+> How it records, what it sends and how a recording replays: [RECORDING.md](RECORDING.md).
+
 Session replay, errors, console and network capture for websites, sent to
 [ReplayIQ](https://github.com/harshrs641/replayiq). Implements the
 [Recording API v1](../../docs/sdk/recording-api-v1.md).

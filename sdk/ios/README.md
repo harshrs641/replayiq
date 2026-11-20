@@ -1,5 +1,7 @@
 # ReplayIQ iOS SDK
 
+> How it records, what it sends and how a recording replays: [RECORDING.md](RECORDING.md).
+
 Session replay for iOS 15+ apps (UIKit and SwiftUI). The SDK records the
 screen as a **Native DOM** (a tree of nodes plus small changes, [Recording API
 v1.1](../../docs/sdk/recording-api-v1.1-native-dom.md)) or as masked

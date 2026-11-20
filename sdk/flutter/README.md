@@ -1,5 +1,7 @@
 # replayiq_flutter
 
+> How it records, what it sends and how a recording replays: [RECORDING.md](RECORDING.md).
+
 ReplayIQ session replay for Flutter apps (iOS and Android).
 
 One `init` call records:
