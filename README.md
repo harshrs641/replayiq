@@ -265,7 +265,7 @@ Each stored batch carries its time range and keyframes as object metadata, so th
 
 **Links:** `http://<dashboard>/?session=<id>&t=<seconds>` opens a session at that moment; "Copy link at this moment" above the player makes one.
 
-The web SDK takes a keyframe at least every 30 s of activity (`checkoutEveryNms`), so a seek never replays more than that. Mobile batches from the Mixpanel adapter are sent with `device_masked: true`: their pixels are masked on the phone, so no second, server-masked copy is stored and replays serve the single copy as "Masked on device".
+The web SDK takes a keyframe at least every 30 s of activity (`checkoutEveryNms`), so a seek never replays more than that. Mobile SDK batches are sent with `device_masked: true`: their pixels are masked on the phone, so no second, server-masked copy is stored and replays serve the single copy as "Masked on device".
 
 ### Trigger analysis manually
 

@@ -1,5 +1,4 @@
-// HTTP capture. Ported from ReplayIQ's Flutter companion
-// (poc/mixpanel-adapter/flutter_poc/lib/replayiq_companion.dart).
+// HTTP capture.
 import 'dart:io';
 
 import 'package:http/http.dart' as http;

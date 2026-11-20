@@ -1,5 +1,4 @@
-// Error and log capture. Ported from ReplayIQ's Flutter companion
-// (poc/mixpanel-adapter/flutter_poc/lib/replayiq_companion.dart).
+// Error and log capture.
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';

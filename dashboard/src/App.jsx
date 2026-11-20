@@ -823,7 +823,7 @@ function buildActivity(events, sessionStart) {
   for (const e of events) {
     const ts = e.timestamp, at = ts - start;
     // Page/screen changes come from Meta events and from app-reported
-    // navigations (mobile companion); show each change once.
+    // navigations (mobile SDKs); show each change once.
     const href = e.type === 4 ? e.data?.href : e.type === 5 && e.subtype === "navigate" ? e.url : null;
     if (href) {
       const key = href.replace(/\/+$/, "");
