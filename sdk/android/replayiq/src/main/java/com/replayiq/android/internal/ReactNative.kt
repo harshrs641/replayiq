@@ -133,10 +133,12 @@ internal object ReactNative {
         return Box(color, if (rr > 0f) floatArrayOf(rr, rr, rr, rr) else null, bw, bc, null, null, false)
     }
 
-    private val getters = HashMap<String, Method?>()
+    private val getters = HashMap<String, HashMap<Class<*>, Method?>>()
 
+    /** Public no-arg [name] of [c], cached by class (no allocation once cached). */
     private fun getter(c: Class<*>, name: String): Method? = synchronized(getters) {
-        getters.getOrPut(c.name + "#" + name) { try { c.getMethod(name) } catch (_: Throwable) { null } }
+        val byClass = getters.getOrPut(name) { HashMap() }
+        if (byClass.containsKey(c)) byClass[c] else (try { c.getMethod(name) } catch (_: Throwable) { null }).also { byClass[c] = it }
     }
 
     // ------------------------------------------------------------------ views

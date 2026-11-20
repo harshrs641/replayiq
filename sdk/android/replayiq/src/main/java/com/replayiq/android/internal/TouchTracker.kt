@@ -98,7 +98,7 @@ internal class TouchTracker(
         val dur = now - downAt
         val dxDp = (x - downX) / density
         val dyDp = (y - downY) / density
-        val sel = { inspector.selectorAt(decor, downX.roundToInt(), downY.roundToInt()) }
+        val sel = { inspector.dragSelectorAt(decor, downX.roundToInt(), downY.roundToInt()) }
         when {
             multiTouch -> if (abs(pinchScale - 1f) > 0.1f) emit(Events.gesture(now, "pinch", sel(), downX / density, downY / density, scale = pinchScale))
             tapCandidate -> {

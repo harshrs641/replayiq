@@ -166,6 +166,7 @@ hint), then the view id.
 | `ScrollView`, `HorizontalScrollView`, `NestedScrollView`, `RecyclerView`, `ListView` | `scroll`: children in content coordinates, scrolling only changes `so` (RecyclerView / ListView offsets are their scrollbar estimates) |
 | `SurfaceView`, `TextureView`, `WebView`, `VideoView`, `MapView`, ExoPlayer `PlayerView`, CameraX `PreviewView`, Lottie, `ProgressBar`, `Switch`, and leaf views that override `onDraw` | `island`: cropped from a masked PixelCopy of the window (SurfaceViews copied on their own), ≤ 2 frames/s, uploaded when it changed; API 24–25: an empty box with a `hint` |
 | Jetpack Compose (see below) | from the semantics tree |
+| React Native (Fabric and the old renderer) | `ReactViewGroup` backgrounds (colour, border width / colour, corner radii) read through RN's public `BackgroundStyleApplicator`; one-sided borders (`borderBottomWidth`) become 1-edge lines; `overflow: hidden` → `clip`; text size / colour / weight from the text's spans; Fabric `PreparedLayoutTextView` from its precomputed layout (else its accessibility text with `"approx": true`); RN's dev-only `DebuggingOverlay` is skipped. Values are cached per view for ≤ 1 s. If RN's classes are renamed (R8 without RN's keep rules) or missing, backgrounds fall back to rasterised images |
 
 Compose (best-effort, from the semantics tree): frames, text with its style (from the public
 `GetTextLayoutResult` action), text fields as `input` (never the value), clickables' roles and
@@ -251,8 +252,14 @@ scripted flow in both modes, after a warm-up run):
 | Diff + serialise (worker) p50 / p95 | n/a | 1.0 / 15.7 ms |
 | Worst frame | 1371 ms | 1460 ms (emulator-bound: every frame was > 16 ms in both modes) |
 
-`ReplayIQ.debugStats(reset)` returns these counters (with `debug(true)`). Debuggable builds run
-largely interpreted on emulators and are ~10x slower, so measure with a release build.
+`ReplayIQ.debugStats(reset)` returns these counters (with `debug(true)`). In any build, `adb shell
+setprop log.tag.ReplayIQStats DEBUG` and an app restart log them every 15 s under the `ReplayIQStats`
+tag. Debuggable builds run largely interpreted on emulators and are ~10x slower, so measure with a
+release build.
+
+React Native example (`sdk/react-native/example`, RN 0.88 Fabric, release build, same emulator, a ~70 s
+checkout → order summary → scroll flow, twice): Native DOM throughout (no screenshot fallback),
+~9–14 KB/min gzipped, main-thread walk p50 / p95 **0.46 / 1.33 ms CPU** (0.52 / 2.08 ms wall).
 
 Screenshot mode: capture planning (finding mask rects) is a view-tree walk on the main thread at most twice a second,
 and only after the window redrew. Pixels are copied by PixelCopy and scaled to 1 px/dp; masking, JPEG
@@ -323,7 +330,11 @@ The RN SDK should be a thin native module over this library:
   or set `nativeID`/`testID`-driven tagging. RN text renders through `ReactTextView` (a `TextView`), so
   `maskAllText` works.
 - **Selectors:** RN sets `accessibilityLabel` → content description, which is used first, so labelled
-  `Pressable`s give good `button:"…"` selectors.
+  `Pressable`s give good `button:"…"` selectors. A tap names the nearest clickable or labelled
+  ancestor; RN's `DebuggingOverlay` is never the target; class names are never used as labels (an
+  unlabelled view gives just its role, e.g. `button`); `testID` is used when there's no label. Pans,
+  swipes and the `scroll` signal name the scroll container by its stable label only (content
+  description, id or `testID`), never by its first visible row.
 - **Network:** RN's `fetch` / `XMLHttpRequest` use OkHttp: add the interceptor with
   `OkHttpClientProvider.setOkHttpClientFactory { OkHttpClientProvider.createClientBuilder().addInterceptor(ReplayIQOkHttpInterceptor()).build() }`.
 - **JS errors:** forward `ErrorUtils.setGlobalHandler` errors to a module method that calls

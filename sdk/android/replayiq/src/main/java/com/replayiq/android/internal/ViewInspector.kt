@@ -132,6 +132,29 @@ internal class ViewInspector(private val options: ReplayIQOptions) {
 
     fun selectorFor(v: View): String = selectorOf(role(v), label(v))
 
+    /**
+     * Label that doesn't change with the content: content description, resource id or RN testID.
+     * Used for scroll containers, whose first visible text changes as they scroll.
+     */
+    fun stableLabel(v: View): String? {
+        v.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let { return clean(it) }
+        idName(v)?.let { return it }
+        return ReactNative.testId(v)?.let { clean(it) }
+    }
+
+    /** Selector of the scroll container a drag at window point ([x], [y]) px moves, else the tap selector. */
+    fun dragSelectorAt(root: View, x: Int, y: Int): String? {
+        val hit = hitTest(root, x, y) ?: return null
+        var cur: View? = hit
+        while (cur != null) {
+            if (cur.canScrollVertically(1) || cur.canScrollVertically(-1) || cur.canScrollHorizontally(1) || cur.canScrollHorizontally(-1)) {
+                return selectorOf("scroll", stableLabel(cur))
+            }
+            cur = cur.parent as? View
+        }
+        return selectorAt(root, x, y)
+    }
+
     /** Role and label a view reports to accessibility services, when it reports a clickable or labelled node. */
     private fun accessibilityName(v: View): Pair<String, String?>? {
         val info = try { v.createAccessibilityNodeInfo() } catch (_: Throwable) { return null }

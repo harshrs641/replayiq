@@ -149,4 +149,19 @@ class ViewInspectorTest {
         val r = Rect(); button.getGlobalVisibleRect(r)
         assertEquals("button:\"Pay now\"", inspector.selectorAt(activity.window.decorView, r.centerX(), r.centerY()))
     }
+
+    @Test fun scrollSelectorsDoNotChangeWithTheVisibleRows() {
+        val list = android.widget.ScrollView(activity).apply {
+            addView(LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                repeat(40) { i -> addView(TextView(activity).apply { text = "Item $i"; height = 120 }) }
+            })
+        }
+        add(list, 600)
+        layout()
+        val r = Rect(); list.getGlobalVisibleRect(r)
+        assertEquals("scroll", inspector.dragSelectorAt(activity.window.decorView, r.centerX(), r.centerY()))
+        list.contentDescription = "Order list"
+        assertEquals("scroll:\"Order list\"", inspector.dragSelectorAt(activity.window.decorView, r.centerX(), r.centerY()))
+    }
 }

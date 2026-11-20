@@ -47,6 +47,17 @@ internal class NodeIds(val id: Int) {
     var composeCache: ComposeDom.Cache? = null
     /** Text style of a TextView read from its spans, kept while the text object is the same. */
     var textStyle: TextStyle? = null
+    /** React Native background read by reflection, reused for the same drawable and size for ≤ 1 s. */
+    var rnBox: ReactNative.Box? = null
+    var rnKey: Any? = null
+    var rnSize = 0L
+    var rnAt = 0L
+    /** Clip shape (RN overflow, outline radius), reused for the same background and size for ≤ 1 s. */
+    var rnClip = false
+    var outlineR = -1f
+    var shapeKey: Any? = null
+    var shapeSize = 0L
+    var shapeAt = Long.MIN_VALUE / 2
 
     /** Id of an extra node drawn for this view: 0 background, 1 content, 2 button, 3 scroll spacer. */
     fun aux(slot: Int): Int {
@@ -91,12 +102,15 @@ internal class ViewWalker(
     private val matrixValues = FloatArray(9)
     private val outline = Outline()
 
+    private var walkStart = 0L
+
     /** Set during a walk when some content was left for the next walk (to stay within budget). */
     var incomplete = false
 
     fun walk(decor: View): WalkResult {
         d = decor.resources.displayMetrics.density
         incomplete = false
+        walkStart = android.os.SystemClock.uptimeMillis()
         islands.clear(); islandArea = 0f; nodes = 0
         images.newWalk()
         val root = node(decor, 0f, 0f) ?: DomNode(idsOf(decor).id, "view").frame(0f, 0f, decor.width / d, decor.height / d)
@@ -126,7 +140,7 @@ internal class ViewWalker(
         val w = v.width
         val h = v.height
         val top = DomNode(ids.id, "view").frame(fx / d, fy / d, w / d, h / d)
-        common(top, v)
+        common(top, v, ids)
 
         if (kind == K_MASK) {
             top.k = "mask"
@@ -140,7 +154,7 @@ internal class ViewWalker(
         }
 
         var edges: List<DomNode>? = null
-        val rn = if (ReactNative.handles(v.background)) ReactNative.box(v, w / d, h / d) else null
+        val rn = if (ReactNative.handles(v.background)) rnBox(ids, v, w, h) else null
         val bg = if (rn != null && !rn.raster) {
             if (rn.edges != null) edges = edgeNodes(ids, rn, w / d, h / d)
             Drawables.Bg(Rect(0, 0, w, h), rn.color, rn.radii?.let { r -> FloatArray(4) { r[it] * d } }, rn.bw * d, rn.bc, null, false, null)
@@ -193,6 +207,15 @@ internal class ViewWalker(
         return top
     }
 
+    private fun rnBox(ids: NodeIds, v: View, w: Int, h: Int): ReactNative.Box? {
+        val key = v.background
+        val size = (w.toLong() shl 32) or h.toLong()
+        if (ids.rnKey === key && ids.rnSize == size && walkStart - ids.rnAt < RN_REFRESH_MS) return ids.rnBox
+        val b = ReactNative.box(v, w / d, h / d)
+        ids.rnBox = b; ids.rnKey = key; ids.rnSize = size; ids.rnAt = walkStart
+        return b
+    }
+
     /** Lines for a border whose edges differ (RN `borderBottomWidth`…): slots 4–7. */
     private fun edgeNodes(ids: NodeIds, b: ReactNative.Box, w: Float, h: Float): List<DomNode> {
         val e = b.edges!!
@@ -233,7 +256,7 @@ internal class ViewWalker(
                 extentX = max(range(g, false).toFloat(), offX + w)
                 extentY = max(range(g, true).toFloat(), offY + h)
             }
-            parent.selector = inspector.label(g)?.let { ViewInspector.selector("scroll", it) } ?: "scroll"
+            parent.selector = inspector.stableLabel(g)?.let { ViewInspector.selector("scroll", it) } ?: "scroll"
             if (parent.clip) parent.clip = false // scroll nodes clip anyway
             parent.c.add(DomNode(ids.aux(3), "view").frame(max(0f, extentX / d - 1f), max(0f, extentY / d - 1f), 1f, 1f))
         }
@@ -257,7 +280,7 @@ internal class ViewWalker(
 
     // ------------------------------------------------------------------ style
 
-    private fun common(n: DomNode, v: View) {
+    private fun common(n: DomNode, v: View, ids: NodeIds) {
         if (v.alpha < 1f) n.alpha = v.alpha
         if (v.translationX != 0f || v.translationY != 0f || v.scaleX != 1f || v.scaleY != 1f || v.rotation != 0f) {
             val m: Matrix = v.matrix
@@ -272,15 +295,26 @@ internal class ViewWalker(
                 n.t = floatArrayOf(a, b, c, dd, tx / d, ty / d)
             }
         }
-        if (v is ViewGroup && v.childCount > 0 && (v.clipChildren || (ReactNative.isReactClass(v.javaClass) && ReactNative.clipsChildren(v)))) n.clip = true
+        // Reflection and getOutline (React Native's builds a Path) are cached per view for ≤ 1 s.
+        val fresh = walkStart - ids.shapeAt < RN_REFRESH_MS && ids.shapeKey === v.background && ids.shapeSize == ((v.width.toLong() shl 32) or v.height.toLong())
+        if (!fresh) {
+            ids.rnClip = v is ViewGroup && ReactNative.isReactClass(v.javaClass) && ReactNative.clipsChildren(v)
+            ids.outlineR = -1f
+            ids.shapeAt = walkStart; ids.shapeKey = v.background; ids.shapeSize = (v.width.toLong() shl 32) or v.height.toLong()
+        }
+        if (v is ViewGroup && v.childCount > 0 && (v.clipChildren || ids.rnClip)) n.clip = true
         if (v.clipToOutline) {
             n.clip = true
-            if (Build.VERSION.SDK_INT >= 24) try {
-                outline.setEmpty()
-                v.outlineProvider?.getOutline(v, outline)
-                val r = outline.radius / d
-                if (r > 0f) n.radii = floatArrayOf(r, r, r, r)
-            } catch (_: Throwable) {}
+            if (ids.outlineR < 0f) {
+                ids.outlineR = 0f
+                if (Build.VERSION.SDK_INT >= 24) try {
+                    outline.setEmpty()
+                    v.outlineProvider?.getOutline(v, outline)
+                    ids.outlineR = max(0f, outline.radius / d)
+                } catch (_: Throwable) {}
+            }
+            val r = ids.outlineR
+            if (r > 0f) n.radii = floatArrayOf(r, r, r, r)
         }
     }
 
@@ -603,6 +637,7 @@ internal class ViewWalker(
         const val K_MASK = 5
         const val K_ISLAND = 6
         const val K_COMPOSE = 7
+        const val RN_REFRESH_MS = 1000L
         const val K_SKIP = 8
         const val K_LTEXT = 9
         const val FAMILY_SCROLLVIEW = 1
