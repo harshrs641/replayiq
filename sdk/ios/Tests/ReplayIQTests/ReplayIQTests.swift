@@ -305,6 +305,26 @@ final class MaskingAndSelectorTests: XCTestCase {
         XCTAssertEqual(ElementSelector.selector(for: button, at: .zero, in: window, masked: false), "button:\"Pay now\"")
         XCTAssertEqual(ElementSelector.selector(for: button, at: .zero, in: window, masked: true), "button")
 
+        // Text inside a tappable container (React Native Pressable) names the container.
+        let pressable = UIView(frame: CGRect(x: 0, y: 100, width: 200, height: 50))
+        pressable.isAccessibilityElement = true
+        pressable.accessibilityTraits = .button
+        pressable.accessibilityLabel = "Checkout"
+        let text = UILabel(frame: CGRect(x: 0, y: 0, width: 200, height: 50))
+        text.text = "Pay now"
+        text.accessibilityLabel = "Pay now"
+        pressable.addSubview(text)
+        window.addSubview(pressable)
+        XCTAssertEqual(ElementSelector.selector(for: text, at: .zero, in: window, masked: false), "button:\"Checkout\"")
+        pressable.accessibilityLabel = nil
+        XCTAssertEqual(ElementSelector.selector(for: text, at: .zero, in: window, masked: false), "button:\"Pay now\"")
+        // Plain text stays text.
+        let plain = UILabel(frame: CGRect(x: 0, y: 200, width: 100, height: 20))
+        plain.text = "Total"
+        plain.accessibilityLabel = "Total"
+        window.addSubview(plain)
+        XCTAssertEqual(ElementSelector.selector(for: plain, at: .zero, in: window, masked: false), "text:\"Total\"")
+
         let field = UITextField()
         field.placeholder = "Email"
         field.text = "secret@example.com"
@@ -328,12 +348,20 @@ final class NetworkAndCrashTests: XCTestCase {
         XCTAssertFalse(NetworkRecorder.shouldRecord(URLRequest(url: URL(string: "https://ingest.example.com/api/v1/events")!)))
         XCTAssertTrue(NetworkRecorder.shouldRecord(URLRequest(url: URL(string: "https://api.example.com/cart")!)))
         XCTAssertFalse(NetworkRecorder.shouldRecord(URLRequest(url: URL(string: "file:///tmp/x")!)))
+        // The SDK's own endpoint: only its upload routes are skipped.
+        NetworkRecorder.ignoredHosts.set([])
+        NetworkRecorder.ownEndpoint.set(URL(string: "http://localhost:8080"))
+        XCTAssertFalse(NetworkRecorder.shouldRecord(URLRequest(url: URL(string: "http://localhost:8080/api/v1/events")!)))
+        XCTAssertFalse(NetworkRecorder.shouldRecord(URLRequest(url: URL(string: "http://localhost:8080/api/v1/assets")!)))
+        XCTAssertTrue(NetworkRecorder.shouldRecord(URLRequest(url: URL(string: "http://localhost:8080/demo/prices")!)))
+        XCTAssertTrue(NetworkRecorder.shouldRecord(URLRequest(url: URL(string: "http://localhost:9999/api/v1/events")!)))
+        NetworkRecorder.ownEndpoint.set(nil)
         NetworkRecorder.includeQuery.set(false)
         XCTAssertEqual(NetworkRecorder.displayURL(URL(string: "https://u:p@api.example.com/a?token=1#f")), "https://api.example.com/a")
     }
 
     func testConfigurationsGetTheProtocol() {
-        NetworkRecorder.install(ignoredHosts: [], includeQuery: false)
+        NetworkRecorder.install(ignoredHosts: [], endpoint: nil, includeQuery: false)
         let c = URLSessionConfiguration.default
         XCTAssertTrue(c.protocolClasses?.first == ReplayIQURLProtocol.self)
         XCTAssertTrue(URLSessionConfiguration.ephemeral.protocolClasses?.first == ReplayIQURLProtocol.self)

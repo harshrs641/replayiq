@@ -191,6 +191,15 @@ final class Recorder {
                 "level": level.name, "message": message, "stack": ""], bytes: message.utf8.count + 80)
     }
 
+    func recordError(_ message: String, stack: String?, filename: String?, line: Int, column: Int) {
+        var e: [String: Any] = ["type": 5, "subtype": "js_error", "timestamp": RIQ.now(), "message": String(message.prefix(4000))]
+        if let stack, !stack.isEmpty { e["stack"] = String(stack.prefix(8000)) }
+        if let filename, !filename.isEmpty { e["filename"] = filename }
+        if line > 0 { e["lineno"] = line }
+        if column > 0 { e["colno"] = column }
+        record(e, bytes: message.utf8.count + (stack?.utf8.count ?? 0) + 120)
+    }
+
     func setOptedOut(_ out: Bool) {
         q.async {
             if out {
@@ -433,9 +442,8 @@ final class Recorder {
         if options.captureTouches { TouchRecorder.install(options: options) }
         if options.trackViewControllers { NavigationTracker.install() }
         if options.captureNetwork {
-            var hosts = Set(options.networkIgnoredHosts.map { $0.lowercased() })
-            if let h = endpoint.host?.lowercased() { hosts.insert(h) }
-            NetworkRecorder.install(ignoredHosts: hosts, includeQuery: options.networkIncludeQuery)
+            let hosts = Set(options.networkIgnoredHosts.map { $0.lowercased() })
+            NetworkRecorder.install(ignoredHosts: hosts, endpoint: endpoint, includeQuery: options.networkIncludeQuery)
         }
         InputTracker.install()
     }

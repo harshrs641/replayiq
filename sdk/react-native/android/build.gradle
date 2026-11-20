@@ -1,0 +1,32 @@
+// React Native bridge over the native ReplayIQ Android SDK.
+buildscript {
+    ext.safeExtGet = { prop, fallback -> rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+
+android {
+    namespace "com.replayiq.reactnative"
+    compileSdkVersion safeExtGet("compileSdkVersion", 35)
+    defaultConfig {
+        minSdkVersion safeExtGet("minSdkVersion", 24)
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+repositories {
+    mavenLocal() // the ReplayIQ Android SDK, until it's on Maven Central
+    google()
+    mavenCentral()
+}
+
+dependencies {
+    implementation "com.facebook.react:react-android"
+    implementation "com.replayiq:replayiq:1.0.0"
+    // RN's fetch/XHR run on OkHttp; the SDK's interceptor records them.
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+}

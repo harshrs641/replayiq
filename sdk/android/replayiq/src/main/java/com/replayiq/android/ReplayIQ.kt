@@ -89,6 +89,30 @@ object ReplayIQ {
     fun permissionResult(name: String, result: String) = safe { Recorder.current?.signals?.permission(name, result) }
 
     /** Paint [view] (and everything inside it) over in recordings. Same as `android:tag="replayiq-mask"`. */
+    /** Decides whether a view is masked; see [maskPredicate]. */
+    fun interface MaskPredicate {
+        fun shouldMask(view: View): Boolean
+    }
+
+    /**
+     * Masks any view for which this returns true, in addition to [mask] and the
+     * default rules. Called on the main thread for many views per capture: keep
+     * it cheap. Wrappers use it to mask by their own markers (e.g. React
+     * Native's `nativeID`).
+     */
+    @JvmStatic
+    @Volatile
+    var maskPredicate: MaskPredicate? = null
+
+    /**
+     * Records an error from the app's own runtime (e.g. JavaScript in React
+     * Native) as `js_error`, with its stack and source location.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun recordError(message: String, stack: String? = null, filename: String? = null, line: Int = 0, column: Int = 0) =
+        safe { Recorder.current?.recordError(message, stack, filename, line, column) }
+
     @JvmStatic
     fun mask(view: View) = safe { view.setTag(R.id.replayiq_mask, true) }
 

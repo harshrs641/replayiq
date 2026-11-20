@@ -1,12 +1,18 @@
 package com.replayiq.android.internal
 
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.os.Build
 import android.text.InputType
+import android.text.Layout
+import android.text.Spanned
+import android.text.TextPaint
+import android.text.style.CharacterStyle
+import android.text.style.MetricAffectingSpan
 import android.view.Gravity
 import android.view.SurfaceView
 import android.view.TextureView
@@ -39,6 +45,8 @@ internal class NodeIds(val id: Int) {
     var compose: HashMap<Long, Int>? = null
     /** Compose styles read from modifiers / text layouts, refreshed at most every second. */
     var composeCache: ComposeDom.Cache? = null
+    /** Text style of a TextView read from its spans, kept while the text object is the same. */
+    var textStyle: TextStyle? = null
 
     /** Id of an extra node drawn for this view: 0 background, 1 content, 2 button, 3 scroll spacer. */
     fun aux(slot: Int): Int {
@@ -47,6 +55,10 @@ internal class NodeIds(val id: Int) {
         return aux[slot]
     }
 }
+
+/** Style resolved from a text's spans (RN sets size, colour and weight as spans). */
+internal class TextStyle(val key: CharSequence, val baseSize: Float, val baseColor: Int, val baseTf: Typeface?,
+                         val size: Float, val color: Int, val tf: Typeface?, val fakeBold: Boolean)
 
 internal object NodeIdAllocator {
     private val counter = AtomicInteger(1)
@@ -107,11 +119,12 @@ internal class ViewWalker(
 
     private fun node(v: View, fx: Float, fy: Float): DomNode? {
         if (v.visibility != View.VISIBLE || v.width <= 0 || v.height <= 0) return null
+        val kind = classify(v)
+        if (kind == K_SKIP) return null
         nodes++
         val ids = idsOf(v)
         val w = v.width
         val h = v.height
-        val kind = classify(v)
         val top = DomNode(ids.id, "view").frame(fx / d, fy / d, w / d, h / d)
         common(top, v)
 
@@ -126,7 +139,13 @@ internal class ViewWalker(
             return top
         }
 
-        val bg = Drawables.describe(v.background, w, h)
+        var edges: List<DomNode>? = null
+        val rn = if (ReactNative.handles(v.background)) ReactNative.box(v, w / d, h / d) else null
+        val bg = if (rn != null && !rn.raster) {
+            if (rn.edges != null) edges = edgeNodes(ids, rn, w / d, h / d)
+            Drawables.Bg(Rect(0, 0, w, h), rn.color, rn.radii?.let { r -> FloatArray(4) { r[it] * d } }, rn.bw * d, rn.bc, null, false, null)
+                .takeIf { rn.color ushr 24 != 0 || rn.bw > 0f || rn.radii != null || v.z >= d * 0.5f }
+        } else Drawables.describe(v.background, w, h)
         var bgChild: DomNode? = null
         if (bg != null) {
             if (bg.raster == null && full(bg.rect, w, h)) applyBg(top, bg, v) else bgChild = bgNode(ids, bg, v)
@@ -150,6 +169,7 @@ internal class ViewWalker(
                     top.k = content.k; top.tx = content.tx; top.img = content.img; top.fit = content.fit; top.input = content.input
                 } else {
                     bgChild?.let { top.c.add(it) }
+                    edges?.let { top.c.addAll(it) }
                     button?.let { top.c.add(it) }
                     content?.let { top.c.add(it) }
                 }
@@ -158,12 +178,35 @@ internal class ViewWalker(
                 bgChild?.let { top.c.add(it) }
                 ComposeDom.append(v, top, this, options)
             }
+            K_LTEXT -> {
+                bgChild?.let { top.c.add(it) }
+                edges?.let { top.c.addAll(it) }
+                layoutTextNode(ids, v)?.let { top.c.add(it) }
+                if (v is ViewGroup) children(v, top, false, ids) // inline views
+            }
             else -> {
                 bgChild?.let { top.c.add(it) }
+                edges?.let { top.c.addAll(it) }
                 if (v is ViewGroup) children(v, top, kind == K_SCROLL, ids)
             }
         }
         return top
+    }
+
+    /** Lines for a border whose edges differ (RN `borderBottomWidth`…): slots 4–7. */
+    private fun edgeNodes(ids: NodeIds, b: ReactNative.Box, w: Float, h: Float): List<DomNode> {
+        val e = b.edges!!
+        val cols = b.edgeColors!!
+        val out = ArrayList<DomNode>(4)
+        fun line(i: Int, x: Float, y: Float, lw: Float, lh: Float) {
+            if (e[i] <= 0f || cols[i] ushr 24 == 0) return
+            out.add(DomNode(ids.aux(4 + i), "view").frame(x, y, lw, lh).also { it.bg = cols[i] })
+        }
+        line(0, 0f, 0f, e[0], h)
+        line(1, 0f, 0f, w, e[1])
+        line(2, w - e[2], 0f, e[2], h)
+        line(3, 0f, h - e[3], w, e[3])
+        return out
     }
 
     private fun isClickableOrInput(v: View) = v.isClickable || v is EditText
@@ -190,7 +233,7 @@ internal class ViewWalker(
                 extentX = max(range(g, false).toFloat(), offX + w)
                 extentY = max(range(g, true).toFloat(), offY + h)
             }
-            parent.selector = ViewInspector.selector("scroll", inspector.label(g))
+            parent.selector = inspector.label(g)?.let { ViewInspector.selector("scroll", it) } ?: "scroll"
             if (parent.clip) parent.clip = false // scroll nodes clip anyway
             parent.c.add(DomNode(ids.aux(3), "view").frame(max(0f, extentX / d - 1f), max(0f, extentY / d - 1f), 1f, 1f))
         }
@@ -229,7 +272,7 @@ internal class ViewWalker(
                 n.t = floatArrayOf(a, b, c, dd, tx / d, ty / d)
             }
         }
-        if (v is ViewGroup && v.clipChildren && v.childCount > 0) n.clip = true
+        if (v is ViewGroup && v.childCount > 0 && (v.clipChildren || (ReactNative.isReactClass(v.javaClass) && ReactNative.clipsChildren(v)))) n.clip = true
         if (v.clipToOutline) {
             n.clip = true
             if (Build.VERSION.SDK_INT >= 24) try {
@@ -283,14 +326,48 @@ internal class ViewWalker(
         }
         val r = textRect(tv)
         val n = DomNode(ids.aux(1), "text").frame(r.left / d, r.top / d, r.width() / d, r.height() / d)
-        n.tx = textInfo(tv, text, color)
+        n.tx = textInfo(tv, text, color, ids)
+        return n
+    }
+
+    /** A view that draws a precomputed [android.text.Layout] (Fabric `PreparedLayoutTextView`). */
+    private fun layoutTextNode(ids: NodeIds, v: View): DomNode? {
+        val lt = ReactNative.layoutText(v)
+        val layout = lt?.layout
+        val raw = lt?.text
+        if (layout == null || raw.isNullOrEmpty()) {
+            // Not readable: the accessibility text, marked as an estimate.
+            val cd = (raw ?: v.contentDescription)?.toString()?.takeIf { it.isNotBlank() } ?: return null
+            val n = DomNode(ids.aux(1), "text").frame(v.paddingLeft / d, v.paddingTop / d,
+                max(1, v.width - v.paddingLeft - v.paddingRight) / d, max(1, v.height - v.paddingTop - v.paddingBottom) / d)
+            n.tx = DomNode.TextInfo(cd, 14f, 400, false, Color.BLACK, null, 0f, 0)
+            n.approx = true
+            return n
+        }
+        val top = v.paddingTop + lt.verticalOffset
+        val n = DomNode(ids.aux(1), "text").frame(v.paddingLeft / d, top / d, layout.width / d,
+            min(layout.height.toFloat(), v.height - top) .coerceAtLeast(1f) / d)
+        val st = style(ids, raw, layout.paint.textSize, layout.paint.color, layout.paint.typeface, layout.paint)
+        val align = when (layout.getParagraphAlignment(0)) {
+            Layout.Alignment.ALIGN_CENTER -> "center"
+            Layout.Alignment.ALIGN_OPPOSITE -> if (layout.getParagraphDirection(0) == Layout.DIR_RIGHT_TO_LEFT) "left" else "right"
+            else -> null
+        }
+        val lh = if (layout.lineCount > 0) (layout.getLineBottom(0) - layout.getLineTop(0)) / d else 0f
+        n.tx = DomNode.TextInfo(clipToLayout(raw.toString(), layout), st.size / d, weightOf(st.tf, st.fakeBold), st.tf?.isItalic == true,
+            st.color, align, lh, lt.maxLines.takeIf { it in 1..999 } ?: 0, monoOf(st.tf))
         return n
     }
 
     private fun displayedText(tv: TextView): String {
         val raw = tv.text ?: return ""
-        var s = try { tv.transformationMethod?.getTransformation(raw, tv)?.toString() } catch (_: Throwable) { null } ?: raw.toString()
-        val layout = tv.layout
+        val s = try { tv.transformationMethod?.getTransformation(raw, tv)?.toString() } catch (_: Throwable) { null } ?: raw.toString()
+        return clipToLayout(s, tv.layout)
+    }
+
+    /** [text] as [layout] shows it: cut at the ellipsis or at the last line. */
+    private fun clipToLayout(text: String, layout: Layout?): String {
+        var s = text
         if (layout != null && layout.lineCount > 0) {
             val last = layout.lineCount - 1
             if (layout.getEllipsisCount(last) > 0) {
@@ -303,13 +380,48 @@ internal class ViewWalker(
         return s
     }
 
-    private fun textInfo(tv: TextView, text: String, color: Int): DomNode.TextInfo {
-        val tf: Typeface? = tv.typeface
-        val weight = when {
-            Build.VERSION.SDK_INT >= 28 && tf != null -> if (tf.isBold && tf.weight < 600) 700 else tf.weight
-            tf?.isBold == true || tv.paint.isFakeBoldText -> 700
+    private val spanPaint = TextPaint()
+
+    /**
+     * Size / colour / typeface of [text] at its first character, after its spans (RN, and any
+     * app using `AbsoluteSizeSpan` / `StyleSpan`…), cached while the text object is the same.
+     */
+    private fun style(ids: NodeIds, text: CharSequence, size: Float, color: Int, tf: Typeface?, base: TextPaint): TextStyle {
+        ids.textStyle?.let { c -> if (c.key === text && c.baseSize == size && c.baseColor == color && c.baseTf === tf) return c }
+        var outSize = size; var outColor = color; var outTf = tf; var fake = base.isFakeBoldText
+        if (text is Spanned && text.isNotEmpty()) {
+            val spans = text.getSpans(0, 1, CharacterStyle::class.java)
+            if (spans.isNotEmpty()) {
+                spanPaint.set(base)
+                spanPaint.textSize = size; spanPaint.color = color; spanPaint.typeface = tf
+                for (sp in spans) try {
+                    if (sp is MetricAffectingSpan) sp.updateMeasureState(spanPaint)
+                    sp.updateDrawState(spanPaint)
+                } catch (_: Throwable) {}
+                outSize = spanPaint.textSize; outColor = spanPaint.color; outTf = spanPaint.typeface; fake = spanPaint.isFakeBoldText
+            }
+        }
+        return TextStyle(text, size, color, tf, outSize, outColor, outTf, fake).also { ids.textStyle = it }
+    }
+
+    private fun weightOf(tf: Typeface?, fakeBold: Boolean): Int {
+        val bold = fakeBold || (tf != null && tf.style and Typeface.BOLD != 0)
+        return when {
+            Build.VERSION.SDK_INT >= 28 && tf != null -> if (bold && tf.weight < 600) 700 else tf.weight
+            bold -> 700
             else -> 400
         }
+    }
+
+    private fun monoOf(tf: Typeface?) = if (tf != null && tf == Typeface.MONOSPACE) "monospace" else null
+
+    private fun textInfo(tv: TextView, text: String, color: Int, ids: NodeIds): DomNode.TextInfo {
+        val raw = tv.text
+        val st = if (raw != null && raw.isNotEmpty() && color == tv.currentTextColor) style(ids, raw, tv.textSize, color, tv.typeface, tv.paint) else null
+        val tf: Typeface? = st?.tf ?: tv.typeface
+        val weight = weightOf(tf, st?.fakeBold ?: tv.paint.isFakeBoldText)
+        val size = st?.size ?: tv.textSize
+        val col = st?.color ?: color
         val align = when (tv.textAlignment) {
             View.TEXT_ALIGNMENT_CENTER -> "center"
             View.TEXT_ALIGNMENT_VIEW_END, View.TEXT_ALIGNMENT_TEXT_END -> if (tv.layoutDirection == View.LAYOUT_DIRECTION_RTL) "left" else "right"
@@ -322,8 +434,7 @@ internal class ViewWalker(
         val layout = tv.layout
         val lh = if (layout != null && layout.lineCount > 0) (layout.getLineBottom(0) - layout.getLineTop(0)) / d else 0f
         val maxLines = tv.maxLines.takeIf { it in 1..999 } ?: 0
-        val font = if (tf != null && tf == Typeface.MONOSPACE) "monospace" else null
-        return DomNode.TextInfo(text, tv.textSize / d, weight, tf?.isItalic == true, color, align, lh, maxLines, font)
+        return DomNode.TextInfo(text, size / d, weight, tf?.isItalic == true, col, align, lh, maxLines, monoOf(tf))
     }
 
     /** Where the text is drawn inside [tv] (px): inside its compound padding, at its vertical gravity. */
@@ -420,6 +531,8 @@ internal class ViewWalker(
         val cached = kinds[cls]
         if (cached != null) return cached
         val k = when {
+            ReactNative.isOverlay(v) -> K_SKIP
+            ReactNative.isLayoutText(v) -> K_LTEXT
             v is SurfaceView || v is TextureView || v is WebView || v is ProgressBar -> K_ISLAND
             islandByName(cls) -> K_ISLAND
             v is Switch || Drawables.isA(cls, "androidx.appcompat.widget.SwitchCompat") -> K_ISLAND
@@ -490,6 +603,8 @@ internal class ViewWalker(
         const val K_MASK = 5
         const val K_ISLAND = 6
         const val K_COMPOSE = 7
+        const val K_SKIP = 8
+        const val K_LTEXT = 9
         const val FAMILY_SCROLLVIEW = 1
         const val FAMILY_LIST = 2
 

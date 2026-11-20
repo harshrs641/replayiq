@@ -35,6 +35,8 @@ internal class DomNode(val id: Int, var k: String) {
     var input: InputInfo? = null
     var so: FloatArray? = null       // scroll offset
     var hint: String? = null
+    /** Text rebuilt from accessibility data: font and position are estimates. */
+    var approx = false
 
     /** Not serialised: selector of a scroll node, for the `scroll` signal. */
     var selector: String? = null
@@ -73,6 +75,7 @@ internal class DomNode(val id: Int, var k: String) {
         if (s.length() > 0) o.put("s", s)
         role?.let { o.put("role", it) }
         label?.let { o.put("label", it) }
+        if (approx) o.put("approx", true)
         tx?.let { t ->
             val j = JSONObject().put("v", t.v).put("size", r1(t.size)).put("col", color(t.color))
             if (t.weight != 400) j.put("w", t.weight)

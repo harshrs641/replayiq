@@ -353,3 +353,97 @@ final class AssetUploadTests: XCTestCase {
         XCTAssertTrue(q.items().isEmpty)
     }
 }
+
+/// Stands in for React Native Fabric's RCTParagraphComponentView.
+@objc(RCTParagraphTestComponentView)
+final class RCTParagraphTestComponentView: UIView {
+    @objc var attributedText: NSAttributedString?
+}
+
+final class ReactNativeFidelityTests: XCTestCase {
+    func all(_ n: DomNode) -> [DomNode] { [n] + n.children.flatMap(all) }
+
+    /// A 9-slice border image like React Native's: a `px`-wide ring.
+    func borderImage(size: Int, px: Int, radius: CGFloat, color: UIColor) -> CGImage {
+        let f = UIGraphicsImageRendererFormat()
+        f.scale = 1
+        f.opaque = false
+        return UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: f).image { _ in
+            let r = CGRect(x: 0, y: 0, width: size, height: size).insetBy(dx: CGFloat(px) / 2, dy: CGFloat(px) / 2)
+            let path = UIBezierPath(roundedRect: r, cornerRadius: radius)
+            path.lineWidth = CGFloat(px)
+            color.setStroke()
+            path.stroke()
+        }.cgImage!
+    }
+
+    func testPaintOrderFollowsZPosition() {
+        let a = CALayer(), b = CALayer(), c = CALayer()
+        b.zPosition = -1024
+        c.zPosition = -1024
+        XCTAssertTrue(DomWalker.paintOrder([a, b, c]).elementsEqual([b, c, a], by: ===))
+        XCTAssertTrue(DomWalker.paintOrder([a, b]).count == 2)
+    }
+
+    func testNineSliceBorderIsDescribed() throws {
+        let img = borderImage(size: 51, px: 3, radius: 24, color: UIColor(red: 0xD1 / 255, green: 0xD5 / 255, blue: 0xDB / 255, alpha: 1))
+        let center = CGRect(x: 24 / 51.0, y: 24 / 51.0, width: 3 / 51.0, height: 3 / 51.0)
+        let b = try XCTUnwrap(DomWalker.sliceBorder(img, center: center, scale: 3))
+        XCTAssertEqual(b.width, 1, accuracy: 0.34)
+        XCTAssertEqual(b.color >> 24, 0xFF)
+        XCTAssertEqual(b.color & 0xFF_FFFF, 0xD1D5DB, "border colour")
+        XCTAssertEqual(b.radius, 8)
+    }
+
+    func testReactNativeComponentReplaysInOrder() throws {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let component = UIView(frame: CGRect(x: 20, y: 100, width: 362, height: 44))
+        window.addSubview(component)
+        let field = UITextField(frame: CGRect(x: 1, y: 1, width: 360, height: 41))
+        field.placeholder = "Full name"
+        component.addSubview(field)
+        // React Native adds these after the subviews, behind them.
+        let bg = CALayer()
+        bg.frame = component.bounds
+        bg.backgroundColor = UIColor.white.cgColor
+        bg.cornerRadius = 8
+        bg.zPosition = -1024
+        component.layer.addSublayer(bg)
+        let border = CALayer()
+        border.frame = component.bounds
+        border.contents = borderImage(size: 51, px: 3, radius: 24, color: .gray)
+        border.contentsCenter = CGRect(x: 24 / 51.0, y: 24 / 51.0, width: 3 / 51.0, height: 3 / 51.0)
+        border.contentsScale = 3
+        border.zPosition = -1024
+        component.layer.addSublayer(border)
+
+        let root = DomWalker(options: ReplayIQOptions()).walk(window).root
+        let nodes = all(root)
+        XCTAssertFalse(nodes.contains { $0.kind == .image }, "no stretched border image")
+        let kinds = nodes.filter { $0.kind == .input || $0.style.bg == 0xFFFF_FFFF || $0.style.borderWidth > 0 }
+        XCTAssertEqual(kinds.last?.kind, .input, "the input paints over its background and border")
+        let borderNode = try XCTUnwrap(nodes.first { $0.style.borderWidth > 0 && $0.kind == .view })
+        XCTAssertEqual(borderNode.style.radii, [8, 8, 8, 8])
+    }
+
+    func testParagraphBecomesText() throws {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let p = RCTParagraphTestComponentView(frame: CGRect(x: 20, y: 82, width: 362, height: 34))
+        p.attributedText = NSAttributedString(string: "Checkout", attributes: [
+            .font: UIFont.systemFont(ofSize: 28, weight: .bold),
+            .foregroundColor: UIColor(red: 0x11 / 255, green: 0x18 / 255, blue: 0x27 / 255, alpha: 1),
+        ])
+        let bitmap = UIView(frame: p.bounds) // RCTParagraphTextView: drawn text
+        bitmap.layer.contents = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { _ in }.cgImage
+        p.addSubview(bitmap)
+        window.addSubview(p)
+        let nodes = all(DomWalker(options: ReplayIQOptions()).walk(window).root)
+        let t = try XCTUnwrap(nodes.first { $0.kind == .text })
+        XCTAssertEqual(t.text?.value, "Checkout")
+        XCTAssertEqual(t.text?.size, 28)
+        XCTAssertEqual(t.text?.weight, 700)
+        XCTAssertEqual(t.text?.color, 0xFF11_1827)
+        XCTAssertTrue(t.children.isEmpty)
+        XCTAssertFalse(nodes.contains { $0.kind == .image || $0.kind == .island }, "its bitmap is not sent")
+    }
+}

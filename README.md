@@ -197,6 +197,16 @@ SDK ─▶ gateway ─▶ ingest API ─▶ Kafka events.native ─▶ transform
 
 The ingest API only checks and accepts a batch (or answers 503 so the SDK retries). The transformer worker keeps mobile batches as sent (`sessions-native` bucket), converts screenshots and Native DOM recordings to rrweb (`internal/transform`), masks, and hands the result to the storage workers. Images and fonts that Native DOM recordings reference live in the `sessions-assets` bucket. Set `PUBLIC_API_URL` on the processor to the address dashboards use to reach the API. The all-in-one server does the same inline.
 
+### SDKs
+
+| Platform | Package | Records |
+|---|---|---|
+| Web | [`sdk/web`](sdk/web) (`@replayiq/web`) | rrweb DOM, clicks, inputs, console, network, errors |
+| Flutter | [`sdk/flutter`](sdk/flutter) (`replayiq_flutter`) | Native DOM (or screenshots), touches, navigation, HTTP, errors |
+| iOS (Swift) | [`sdk/ios`](sdk/ios) (`ReplayIQ`) | Native DOM from the layer tree (or screenshots), touches, URLSession, crashes |
+| Android (Kotlin) | [`sdk/android`](sdk/android) (`com.replayiq:replayiq`) | Native DOM from the View tree / Compose (or screenshots), touches, OkHttp, crashes |
+| React Native | [`sdk/react-native`](sdk/react-native) (`@replayiq/react-native`) | Wraps the iOS and Android SDKs, plus JS errors, console and React Navigation screens |
+
 ### Building an SDK for another platform
 
 Every SDK (web, Flutter, iOS, Android, React Native) talks to the same [Recording API v1](docs/sdk/recording-api-v1.md). It covers authentication, gzip, batching, retries, mobile screenshots and touches, and the shared app-event types. [Recording API v1.1](docs/sdk/recording-api-v1.1-native-dom.md) adds Native DOM recording for mobile, where the UI is sent as a tree of nodes and changes instead of screenshots, plus mobile-only signals.

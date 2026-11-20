@@ -100,7 +100,7 @@ final class DomWalker {
         let layer = window.layer
         var root = DomNode(id: DomWalker.id(layer), kind: .view, frame: CGRect(origin: .zero, size: windowBounds.size))
         root.style.bg = DomColor.argb(layer.backgroundColor)
-        for sub in layer.sublayers ?? [] {
+        for sub in DomWalker.paintOrder(layer.sublayers) {
             visit(sub, base: .zero, win: .zero, host: window, into: &root.children)
         }
         // Content under a mask (e.g. SwiftUI views under `.replayIQMask()`,
@@ -144,7 +144,7 @@ final class DomWalker {
         let origin = CGPoint(x: g.position.x - g.anchorPoint.x * size.width, y: g.position.y - g.anchorPoint.y * size.height)
         let frame = CGRect(x: base.x + origin.x, y: base.y + origin.y, width: size.width, height: size.height)
         let winRect = CGRect(x: win.x + origin.x, y: win.y + origin.y, width: size.width, height: size.height)
-        let sublayers = layer.sublayers ?? []
+        let sublayers = DomWalker.paintOrder(layer.sublayers)
         let transform = DomWalker.transform(g, size: size)
         if transform == .identity, !winRect.intersects(windowBounds.insetBy(dx: -40, dy: -40)),
            sublayers.isEmpty || g.masksToBounds { return }
@@ -236,6 +236,17 @@ final class DomWalker {
                 out.append(node)
                 return
             }
+            if ClassFlags.of(type(of: view)).paragraph, let text = DomWalker.paragraphText(view) {
+                // React Native (Fabric) text: the component knows its string
+                // and style; its bitmap child is skipped.
+                if options.maskAllText { node.kind = .mask; maskRects.append(winRect) } else {
+                    node.kind = .text
+                    node.text = text
+                    contentRects.append((node.id, winRect))
+                }
+                out.append(node)
+                return
+            }
             if view.isAccessibilityElement {
                 node.role = ElementSelector.role(of: view)
                 if node.role == "view" { node.role = nil }
@@ -263,7 +274,20 @@ final class DomWalker {
             if node.style.bg == nil || node.style.bg! >> 24 == 0 { node.style.bg = dark ? 0xD91C_1C1E : 0xD9F2_F2F7 }
         } else if let contents = layer.contents {
             let cf = contents as CFTypeRef
-            if CFGetTypeID(cf) == CGImage.typeID {
+            if CFGetTypeID(cf) == CGImage.typeID, layer.contentsCenter != CGRect(x: 0, y: 0, width: 1, height: 1) {
+                // A stretchable (9-slice) image, e.g. React Native's border
+                // layer: described as a border, or left to the owner's style.
+                guard let b = DomWalker.sliceBorder(contents as! CGImage, center: layer.contentsCenter,
+                                                    scale: layer.contentsScale), sublayers.isEmpty else {
+                    count -= 1
+                    return
+                }
+                node.style.borderWidth = b.width
+                node.style.borderColor = b.color
+                if node.style.radii == nil, b.radius > 0 { node.style.radii = [b.radius, b.radius, b.radius, b.radius] }
+                out.append(node)
+                return
+            } else if CFGetTypeID(cf) == CGImage.typeID {
                 node.kind = .image
                 node.pixels = .image(contents as! CGImage)
                 node.fit = DomWalker.fit(layer.contentsGravity)
@@ -342,9 +366,89 @@ final class DomWalker {
                                      frame: CGRect(x: 0, y: 0, width: max(winRect.width, content.width + inset.left + inset.right),
                                                    height: max(winRect.height, content.height + inset.top + inset.bottom))))
         let childWin = CGPoint(x: winRect.minX - offset.x, y: winRect.minY - offset.y)
-        for s in sv.layer.sublayers ?? [] {
+        for s in DomWalker.paintOrder(sv.layer.sublayers) {
             visit(s, base: shift, win: childWin, host: sv, into: &node.children)
         }
+    }
+
+    // MARK: - Ordering, borders, React Native text
+
+    /// Sublayers in paint order: `zPosition` first (React Native puts its
+    /// background and border layers after the subviews with a negative
+    /// zPosition), then their order.
+    static func paintOrder(_ layers: [CALayer]?) -> [CALayer] {
+        guard let layers, layers.contains(where: { $0.zPosition != 0 }) else { return layers ?? [] }
+        return layers.enumerated().sorted {
+            $0.element.zPosition != $1.element.zPosition ? $0.element.zPosition < $1.element.zPosition : $0.offset < $1.offset
+        }.map(\.element)
+    }
+
+    struct SliceBorder {
+        var width: CGFloat
+        var color: UInt32
+        var radius: CGFloat
+    }
+
+    private static var sliceCache: [ObjectIdentifier: (CGImage, SliceBorder?)] = [:]
+
+    /// Reads a stretchable border image: the border's width and colour from
+    /// its edges (the widest edge when they differ), the corner radius from
+    /// the stretch insets. Nil when the image has no visible edge.
+    static func sliceBorder(_ img: CGImage, center: CGRect, scale: CGFloat) -> SliceBorder? {
+        let key = ObjectIdentifier(img)
+        if let hit = sliceCache[key], hit.0 === img { return hit.1 }
+        let result = readSlice(img, center: center, scale: max(1, scale))
+        if sliceCache.count > 256 { sliceCache.removeAll() }
+        sliceCache[key] = (img, result)
+        return result
+    }
+
+    private static func readSlice(_ img: CGImage, center: CGRect, scale: CGFloat) -> SliceBorder? {
+        let w = img.width, h = img.height
+        guard w >= 3, h >= 3, w * h <= 512 * 512,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let data = ctx.data else { return nil }
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let px = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        func pixel(_ x: Int, _ y: Int) -> (r: Int, g: Int, b: Int, a: Int) {
+            let i = (y * w + x) * 4
+            return (Int(px[i]), Int(px[i + 1]), Int(px[i + 2]), Int(px[i + 3]))
+        }
+        // Run of visible pixels from an edge inwards, and its middle pixel.
+        func edge(_ steps: Int, _ at: (Int) -> (Int, Int)) -> (Int, (r: Int, g: Int, b: Int, a: Int))? {
+            var n = 0
+            while n < steps / 2, pixel(at(n).0, at(n).1).a > 127 { n += 1 }
+            // Nothing visible, or filled to the middle (a background, not a border).
+            guard n > 0, n < steps / 2 else { return nil }
+            let mid = at(n / 2)
+            return (n, pixel(mid.0, mid.1))
+        }
+        let edges = [edge(w) { (x: $0, y: h / 2) }, edge(w) { (x: w - 1 - $0, y: h / 2) },
+                     edge(h) { (x: w / 2, y: $0) }, edge(h) { (x: w / 2, y: h - 1 - $0) }].compactMap { $0 }
+        guard let widest = edges.max(by: { $0.0 < $1.0 }) else { return nil }
+        let p = widest.1
+        func un(_ c: Int) -> UInt32 { UInt32(min(255, p.a > 0 ? c * 255 / p.a : 0)) }
+        let color = UInt32(p.a) << 24 | un(p.r) << 16 | un(p.g) << 8 | un(p.b)
+        let width = CGFloat(widest.0) / scale
+        let inset = center.minX * CGFloat(w) / scale
+        return SliceBorder(width: width, color: color, radius: inset > width + 0.5 ? inset.rounded() : 0)
+    }
+
+    /// React Native (Fabric) paragraph text from the component's attributed string.
+    static func paragraphText(_ view: UIView) -> DomText? {
+        let sel = NSSelectorFromString("attributedText")
+        guard view.responds(to: sel), let a = view.value(forKey: "attributedText") as? NSAttributedString,
+              a.length > 0 else { return nil }
+        let font = a.attribute(.font, at: 0, effectiveRange: nil) as? UIFont ?? .systemFont(ofSize: 14)
+        let color = (a.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? UIColor ?? .black)
+            .resolvedColor(with: view.traitCollection).cgColor
+        let para = a.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        var t = text(value: a.string, font: font, color: color, alignment: para?.alignment ?? .natural,
+                     rtl: view.effectiveUserInterfaceLayoutDirection == .rightToLeft, lines: 0)
+        if let lh = para?.minimumLineHeight, lh > 0 { t.lineHeight = lh }
+        return t
     }
 
     // MARK: - Islands
@@ -613,6 +717,8 @@ struct ClassFlags {
     var portal = false
     var backdrop = false
     var drawing = false
+    /// React Native Fabric text (RCTParagraphComponentView).
+    var paragraph = false
     var islandHint: String?
 
     private static var cache: [ObjectIdentifier: ClassFlags] = [:]
@@ -626,6 +732,7 @@ struct ClassFlags {
         f.portal = name == "CAPortalLayer" || name.contains("PortalView")
         f.backdrop = name == "CABackdropLayer"
         f.drawing = name.contains("DrawingLayer")
+        f.paragraph = name.hasPrefix("RCTParagraph") && name.hasSuffix("ComponentView")
         switch name {
         case "MKMapView": f.islandHint = "map"
         case "WKWebView": f.islandHint = "web"

@@ -112,4 +112,41 @@ class ViewInspectorTest {
         assertEquals("button:\"say 'hi' now\"", ViewInspector.selector("button", "say \"hi\"\nnow"))
         assertEquals(60, ViewInspector.clean("x".repeat(100)).length)
     }
+
+    @Test fun tapsIgnoreDebugOverlaysAndNeverUseClassNames() {
+        val button = add(FrameLayout(activity).apply {
+            isClickable = true
+            addView(TextView(activity).apply { text = "Pay now" })
+        }, 200)
+        // A full-screen overlay drawn on top, like React Native's DebuggingOverlay.
+        (activity.window.decorView as ViewGroup).addView(
+            com.replayiq.android.internal.fake.DebuggingOverlay(activity), ViewGroup.LayoutParams(1080, 2400))
+        val unlabelled = add(FrameLayout(activity).apply { isClickable = true }, 200)
+        layout()
+        val r = Rect(); button.getGlobalVisibleRect(r)
+        assertEquals("button:\"Pay now\"", inspector.selectorAt(activity.window.decorView, r.centerX(), r.centerY()))
+        unlabelled.getGlobalVisibleRect(r)
+        assertEquals("button", inspector.selectorAt(activity.window.decorView, r.centerX(), r.centerY()))
+    }
+
+    @Test fun tapsUseTheNearestAccessibilityLabelWhenNothingIsClickable() {
+        // React Native: a Pressable is a focusable view with a content description, not clickable.
+        val pressable = add(FrameLayout(activity).apply {
+            isFocusable = true
+            contentDescription = "Pay now"
+            addView(TextView(activity).apply { text = "Pay now" })
+        }, 200)
+        layout()
+        val r = Rect(); pressable.getGlobalVisibleRect(r)
+        assertEquals("button:\"Pay now\"", inspector.selectorAt(activity.window.decorView, r.centerX(), r.centerY()))
+    }
+
+    @Test fun tapsPassThroughEmptyFullScreenContainers() {
+        val button = add(Button(activity).apply { text = "Pay now" }, 200)
+        // A transparent, non-clickable container on top (React Native box-none wrapper / LogBox).
+        (activity.window.decorView as ViewGroup).addView(FrameLayout(activity), ViewGroup.LayoutParams(1080, 2400))
+        layout()
+        val r = Rect(); button.getGlobalVisibleRect(r)
+        assertEquals("button:\"Pay now\"", inspector.selectorAt(activity.window.decorView, r.centerX(), r.centerY()))
+    }
 }

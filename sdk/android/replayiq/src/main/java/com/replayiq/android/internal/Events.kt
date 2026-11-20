@@ -36,6 +36,14 @@ internal object Events {
             .put("duration", durationMs.coerceAtLeast(0))
             .apply { if (!error.isNullOrEmpty()) put("error", error.take(MAX_TEXT)) }
 
+    fun runtimeError(ts: Long, message: String, stack: String?, filename: String?, line: Int, column: Int): JSONObject =
+        custom("js_error", ts).put("message", message.take(MAX_TEXT)).apply {
+            if (!stack.isNullOrEmpty()) put("stack", stack.take(MAX_STACK))
+            if (!filename.isNullOrEmpty()) put("filename", filename)
+            if (line > 0) put("lineno", line)
+            if (column > 0) put("colno", column)
+        }
+
     fun jsError(ts: Long, t: Throwable): JSONObject {
         val top = t.stackTrace.firstOrNull()
         val message = "${t.javaClass.name}: ${t.message ?: ""}".trimEnd(' ', ':')

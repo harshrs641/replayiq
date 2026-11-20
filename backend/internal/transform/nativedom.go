@@ -424,6 +424,7 @@ func (c *converter) css(n ndNode) string {
 		}
 	case "input":
 		b.WriteString("display:flex;align-items:center;padding:0 8px;white-space:nowrap;overflow:hidden;")
+		b.WriteString("font:15px " + fontStack("") + ";")
 		if n.In != nil {
 			if n.In.Len == 0 {
 				b.WriteString("color:#9ca3af;")

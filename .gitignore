@@ -7,7 +7,7 @@ backend/.dev/
 
 # Go binaries
 backend/replayiq-*
-replayiq-*
+/replayiq-*
 *.exe
 
 # Node
@@ -25,3 +25,7 @@ dashboard/dist/
 .claude/
 sdk/web/node_modules/
 sdk/web/dist/
+sdk/react-native/android/build/
+sdk/react-native/android/.gradle/
+sdk/react-native/android/.cxx/
+sdk/react-native/node_modules/

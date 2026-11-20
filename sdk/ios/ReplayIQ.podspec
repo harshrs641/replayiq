@@ -9,6 +9,8 @@ Pod::Spec.new do |s|
   s.platform      = :ios, '15.0'
   s.swift_version = '5.9'
   s.source_files  = 'Sources/ReplayIQ/**/*.swift'
-  s.frameworks    = 'UIKit', 'SwiftUI', 'ImageIO', 'UniformTypeIdentifiers', 'Compression', 'CryptoKit',
+  s.frameworks    = 'UIKit', 'SwiftUI', 'ImageIO', 'UniformTypeIdentifiers', 'CryptoKit',
                     'Network', 'AVFoundation', 'Photos', 'CoreLocation', 'UserNotifications'
+  # Apple's Compression module is libcompression (a library, not a framework).
+  s.libraries     = 'compression'
 end

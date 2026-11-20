@@ -80,6 +80,8 @@ internal class Recorder internal constructor(
     /** AUTO mode: the screen being recorded with screenshots because it's mostly islands. */
     private var screenshotScreen: String? = null
     private var lastStatsLog = 0L
+    /** Cost counters: with `debug(true)`, or in any build after `adb shell setprop log.tag.ReplayIQStats DEBUG` (then restart the app). */
+    private val statsOn = options.debug || try { android.util.Log.isLoggable(STATS_TAG, android.util.Log.DEBUG) } catch (_: Throwable) { false }
 
     private val packageName: String = app.packageName
     private val sdkId = options.sdk ?: "${ReplayIQ.SDK_NAME}/${ReplayIQ.sdkVersion}"
@@ -87,7 +89,11 @@ internal class Recorder internal constructor(
     private val flushTick = object : Runnable {
         override fun run() {
             flush()
-            if (options.debug && clock() - lastStatsLog >= STATS_LOG_MS) { lastStatsLog = clock(); Log.d(Stats.summary(options.recordingMode.name)) }
+            if (statsOn && clock() - lastStatsLog >= STATS_LOG_MS) {
+                lastStatsLog = clock()
+                val line = Stats.summary(options.recordingMode.name)
+                if (options.debug) Log.d(line) else android.util.Log.d(STATS_TAG, line)
+            }
             worker.postDelayed(this, options.flushIntervalMs)
         }
     }
@@ -219,7 +225,7 @@ internal class Recorder internal constructor(
     fun addEvent(ev: JSONObject) {
         if (!isRecording()) return
         val size = eventSize(ev)
-        if (options.debug) Stats.event(ev)
+        if (statsOn) Stats.event(ev)
         val full: Boolean
         synchronized(bufferLock) {
             buffer.add(ev)
@@ -285,6 +291,9 @@ internal class Recorder internal constructor(
     }
 
     fun log(message: String, level: String, stack: String?) = addEvent(Events.console(clock(), level, message, stack))
+
+    fun recordError(message: String, stack: String?, filename: String?, line: Int, column: Int) =
+        addEvent(Events.runtimeError(clock(), message, stack, filename, line, column))
 
     fun logError(t: Throwable) =
         log("${t.javaClass.name}: ${t.message ?: ""}", "error", android.util.Log.getStackTraceString(t))
@@ -519,6 +528,7 @@ internal class Recorder internal constructor(
         const val MAX_REQUEST_EVENTS = 100
         const val MAX_BATCH_BYTES = 3L * 1024 * 1024
         const val STATS_LOG_MS = 15_000L
+        const val STATS_TAG = "ReplayIQStats"
 
         @Volatile var current: Recorder? = null
             private set

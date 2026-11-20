@@ -126,6 +126,19 @@ public final class ReplayIQ: NSObject {
         Recorder.shared?.screen(name)
     }
 
+    /// Masks any view for which this returns true, in addition to
+    /// `replayIQMasked` and the default rules. Called on the main thread for
+    /// many views per capture: keep it cheap. Wrappers use it to mask by
+    /// their own markers (e.g. React Native's `nativeID`).
+    @objc public static var maskPredicate: ((UIView) -> Bool)?
+
+    /// Records an error from the app's own runtime (e.g. JavaScript in React
+    /// Native) as `js_error`, with its stack and source location.
+    @objc(recordError:stack:filename:line:column:)
+    public static func recordError(_ message: String, stack: String?, filename: String?, line: Int, column: Int) {
+        Recorder.shared?.recordError(message, stack: stack, filename: filename, line: line, column: column)
+    }
+
     /// Sends a log line to the Console tab.
     @objc(log:level:)
     public static func log(_ message: String, level: ReplayIQLogLevel = .log) {

@@ -24,6 +24,7 @@ internal class ViewInspector(private val options: ReplayIQOptions) {
     fun explicit(v: View): Boolean? {
         (v.getTag(R.id.replayiq_mask) as? Boolean)?.let { return it }
         if (v.tag == XML_TAG) return true
+        if (com.replayiq.android.ReplayIQ.maskPredicate?.shouldMask(v) == true) return true
         return null
     }
 
@@ -73,13 +74,25 @@ internal class ViewInspector(private val options: ReplayIQOptions) {
         if (!root.getGlobalVisibleRect(r) || !r.contains(x, y)) return null
         if (root is ViewGroup) {
             for (i in root.childCount - 1 downTo 0) { // last drawn = on top
-                val hit = hitTest(root.getChildAt(i), x, y) ?: continue
+                val child = root.getChildAt(i)
+                // React Native's debug overlay covers the screen but never handles touches.
+                if (ReactNative.isOverlay(child)) continue
+                val hit = hitTest(child, x, y) ?: continue
                 // Compose's interop container covers the whole composable: the composable is the target.
                 if (hit is ViewGroup && hit.javaClass.simpleName == "AndroidViewsHandler") continue
+                // A see-through container with nothing of its own under the finger (React Native's
+                // full-screen `box-none` wrappers, LogBox): the view below is what was tapped.
+                if (hit === child && hit is ViewGroup && isPassThrough(hit)) continue
                 return hit
             }
         }
         return root
+    }
+
+    private fun isPassThrough(g: ViewGroup): Boolean {
+        if (g.isClickable || g.isLongClickable || !g.contentDescription.isNullOrBlank()) return false
+        val bg = g.background ?: return true
+        return bg is android.graphics.drawable.ColorDrawable && android.graphics.Color.alpha(bg.color) == 0
     }
 
     /** `role:"label"` for a tap at window point ([x], [y]) px. */
@@ -94,10 +107,54 @@ internal class ViewInspector(private val options: ReplayIQOptions) {
             if (cur.isClickable || cur.isLongClickable) { target = cur; break }
             cur = cur.parent as? View
         }
-        return selector(role(target), label(target))
+        if (target === hit && !hit.isClickable) {
+            // Nothing clickable (React Native handles touches in JS): the nearest view with an
+            // accessibility label names the tap, e.g. a Pressable with accessibilityLabel.
+            // React Native reports labels and clickability through its accessibility delegate,
+            // not on the view, so ask for the accessibility node (taps only: cheap enough).
+            var c: View? = hit
+            var depth = 0
+            while (c != null && depth < 5) {
+                val desc = c.contentDescription?.toString()
+                if (!desc.isNullOrBlank()) {
+                    return selectorOf(if (c.isFocusable && c !is TextView) "button" else role(c), label(c))
+                }
+                accessibilityName(c)?.let { (role, label) -> return selectorOf(role, if (isMaskedOrInside(c!!)) null else label) }
+                c = c.parent as? View
+                depth++
+            }
+            if (ReactNative.isLayoutText(hit) && !isMaskedOrInside(hit)) {
+                ReactNative.layoutText(hit)?.text?.toString()?.takeIf { it.isNotBlank() }?.let { return selector("text", it) }
+            }
+        }
+        return selectorOf(role(target), label(target))
     }
 
-    fun selectorFor(v: View): String = selector(role(v), label(v))
+    fun selectorFor(v: View): String = selectorOf(role(v), label(v))
+
+    /** Role and label a view reports to accessibility services, when it reports a clickable or labelled node. */
+    private fun accessibilityName(v: View): Pair<String, String?>? {
+        val info = try { v.createAccessibilityNodeInfo() } catch (_: Throwable) { return null }
+        try {
+            val label = info.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let { clean(it) }
+            val cls = info.className?.toString() ?: ""
+            val role = when {
+                cls.endsWith("Button") || info.isClickable -> "button"
+                cls.endsWith("EditText") -> "input"
+                cls.endsWith("ImageView") -> "image"
+                else -> null
+            }
+            return when {
+                role != null -> role to label
+                label != null -> "view" to label
+                else -> null
+            }
+        } finally {
+            @Suppress("DEPRECATION") try { info.recycle() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun selectorOf(role: String, label: String?) = if (label == null) role else selector(role, label)
 
     fun role(v: View): String = when (v) {
         is EditText -> "input"
@@ -115,8 +172,11 @@ internal class ViewInspector(private val options: ReplayIQOptions) {
         }
     }
 
-    /** Visible label of [v]: content description, else its text (never the text of a masked view or input), else its id. */
-    fun label(v: View): String {
+    /**
+     * Visible label of [v]: content description, else its text (never the text of a masked view or
+     * input), else its id or RN testID. Null when it has none: never a class name.
+     */
+    fun label(v: View): String? {
         val masked = isMaskedOrInside(v)
         v.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let { return clean(it) }
         if (v is EditText) {
@@ -126,7 +186,8 @@ internal class ViewInspector(private val options: ReplayIQOptions) {
             if (v is ViewGroup) firstText(v)?.let { return clean(it) }
         }
         idName(v)?.let { return it }
-        return v.javaClass.simpleName.ifEmpty { "View" }
+        ReactNative.testId(v)?.let { return clean(it) }
+        return null
     }
 
     private fun firstText(g: ViewGroup, depth: Int = 0): String? {
@@ -136,13 +197,15 @@ internal class ViewInspector(private val options: ReplayIQOptions) {
             if (c.visibility != View.VISIBLE || isMasked(c)) continue
             c.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let { return it }
             if (c is TextView && c !is EditText) c.text?.toString()?.takeIf { it.isNotBlank() }?.let { return it }
+            if (ReactNative.isLayoutText(c)) ReactNative.layoutText(c)?.text?.toString()?.takeIf { it.isNotBlank() }?.let { return it }
             if (c is ViewGroup) firstText(c, depth + 1)?.let { return it }
         }
         return null
     }
 
     private fun idName(v: View): String? {
-        if (v.id == View.NO_ID || v.id == 0) return null
+        // Only resource ids (package byte set): React Native uses small React tags as view ids.
+        if (v.id == View.NO_ID || v.id ushr 24 == 0) return null
         return try { "#" + v.resources.getResourceEntryName(v.id) } catch (_: Exception) { null }
     }
 

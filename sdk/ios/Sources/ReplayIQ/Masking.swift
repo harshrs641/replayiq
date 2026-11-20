@@ -7,7 +7,10 @@ public extension UIView {
     /// Paint this view (and everything inside it) over in recordings. The
     /// pixels are covered on the device, before the screenshot is encoded.
     @objc var replayIQMasked: Bool {
-        get { (objc_getAssociatedObject(self, &maskedKey) as? NSNumber)?.boolValue ?? false }
+        get {
+            if let flag = (objc_getAssociatedObject(self, &maskedKey) as? NSNumber)?.boolValue { return flag }
+            return ReplayIQ.maskPredicate?(self) ?? false
+        }
         set { objc_setAssociatedObject(self, &maskedKey, NSNumber(value: newValue), .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
 }

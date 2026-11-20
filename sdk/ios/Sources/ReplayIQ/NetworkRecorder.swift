@@ -8,9 +8,14 @@ enum NetworkRecorder {
     private static var installed = false
     static let ignoredHosts = Locked<Set<String>>([])
     static let includeQuery = Locked(false)
+    /// The SDK's own ingest endpoint: only its upload routes are skipped, so
+    /// the app's other requests to the same host are still recorded.
+    static let ownEndpoint = Locked<URL?>(nil)
+    static let ownRoutes = ["/api/v1/sessions", "/api/v1/events", "/api/v1/assets"]
 
-    static func install(ignoredHosts hosts: Set<String>, includeQuery q: Bool) {
+    static func install(ignoredHosts hosts: Set<String>, endpoint: URL?, includeQuery q: Bool) {
         ignoredHosts.set(hosts)
+        ownEndpoint.set(endpoint)
         includeQuery.set(q)
         guard !installed else { return }
         installed = true
@@ -24,8 +29,17 @@ enum NetworkRecorder {
     static func shouldRecord(_ request: URLRequest) -> Bool {
         guard let url = request.url, let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
         if let host = url.host?.lowercased(), ignoredHosts.get.contains(host) { return false }
+        if isOwnUpload(url) { return false }
         return true
     }
+
+    static func isOwnUpload(_ url: URL) -> Bool {
+        guard let own = ownEndpoint.get, url.host?.lowercased() == own.host?.lowercased(),
+              (url.port ?? defaultPort(url)) == (own.port ?? defaultPort(own)) else { return false }
+        return ownRoutes.contains { url.path.hasPrefix($0) }
+    }
+
+    private static func defaultPort(_ url: URL) -> Int { url.scheme?.lowercased() == "https" ? 443 : 80 }
 
     static func displayURL(_ url: URL?) -> String {
         guard let url else { return "" }

@@ -73,6 +73,12 @@ enum ElementSelector {
         var depth = 0
         while let cur = v, depth < 8 {
             if !(cur is UIWindow), let l = label(of: cur) {
+                // Text inside a tappable container (React Native's Pressable,
+                // a custom card): name the container, e.g. button:"Pay now".
+                if !isInteractive(cur), let owner = interactiveAncestor(of: cur) {
+                    let ownerLabel = label(of: owner) ?? l
+                    return format(role(of: owner), masked ? nil : ownerLabel)
+                }
                 return format(role(of: cur), masked && !(cur is UITextField) ? nil : l)
             }
             v = cur.superview
@@ -91,6 +97,22 @@ enum ElementSelector {
             depth += 1
         }
         return format(role(of: view), nil)
+    }
+
+    static func isInteractive(_ v: UIView) -> Bool {
+        v is UIControl || v.accessibilityTraits.contains(.button) || v.accessibilityTraits.contains(.link)
+    }
+
+    /// The nearest ancestor (within a few levels) that is a button, link or control.
+    static func interactiveAncestor(of view: UIView) -> UIView? {
+        var v = view.superview
+        var depth = 0
+        while let cur = v, depth < 4, !(cur is UIWindow) {
+            if isInteractive(cur) { return cur }
+            v = cur.superview
+            depth += 1
+        }
+        return nil
     }
 
     static func element(at p: CGPoint, in obj: NSObject, depth: Int) -> NSObject? {

@@ -293,9 +293,10 @@ continues the previous one.
   added to the public API when the bridge is built.
 - Network: `fetch`/XHR in RN go through `NSURLSession` with the default
   configuration, so they are recorded automatically.
-- Native DOM works on RN apps unchanged, because RN views are UIViews. Text
-  is drawn by RN's own text views into layer bitmaps, so it becomes islands
-  labelled by accessibility. A later improvement could read `RCTTextView`'s
-  attributed string and send real `text` nodes.
+- Native DOM works on RN (Fabric) apps:
+  - `RCTParagraphComponentView` text becomes real `text` nodes, read from its attributed string (font, size, weight, colour, alignment).
+  - RN's stretchable (9-slice) border images become `bw`/`bc`/`r` borders.
+  - Background and border layers are painted behind children, ordered by `zPosition`.
+  - Borders on only some sides are drawn on all four sides. The spec has no per-side borders yet.
 - Taps on RN views get selectors from `accessibilityLabel` (set
   `accessibilityLabel` / `accessibilityRole` in JS for good selectors).
