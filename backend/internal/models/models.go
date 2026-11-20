@@ -62,6 +62,11 @@ type EventBatch struct {
 	BatchID string `json:"batch_id,omitempty"`
 	// Platform: web, flutter, ios, android or react-native.
 	Platform string `json:"platform,omitempty"`
+	// DataMode (Recording API v1.2): "masked" (only masked data leaves the
+	// device; one stored copy) or "raw" (recorded unmasked except the
+	// always-masked data; the server stores raw and masked copies). Empty
+	// for older SDKs.
+	DataMode string `json:"data_mode,omitempty"`
 	SDK      string `json:"sdk,omitempty"`
 	// Dropped counts events skipped while decoding because they didn't
 	// fit the schema (see EventBatch.UnmarshalJSON).

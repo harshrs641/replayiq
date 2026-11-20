@@ -61,7 +61,10 @@ type ndNode struct {
 	Img   *ndImage  `json:"img"`
 	In    *ndInput  `json:"in"`
 	So    []float64 `json:"so"`
-	Hint  string    `json:"hint"`
+	// Masked (raw recordings, v1.2): masked mode would hide this node; the
+	// masked copy turns it into a mask block.
+	Masked bool   `json:"masked"`
+	Hint   string `json:"hint"`
 }
 
 type ndStyle struct {
@@ -105,6 +108,8 @@ type ndInput struct {
 	Ph    string `json:"ph"`
 	Len   int    `json:"len"`
 	Focus bool   `json:"focus"`
+	// V: the field's value, sent only in raw recordings (never passwords).
+	V string `json:"v"`
 }
 
 type ndFont struct {
@@ -216,6 +221,7 @@ func (c *converter) convertMutation(e models.RRWebEvent) ([]models.RRWebEvent, e
 		addList = appendFlat(addList, parentElem(a.P), next, c.node(a.N))
 	}
 	for _, u := range updates {
+		c.hide(&u)
 		at := map[string]any{"style": c.css(u)}
 		if u.K == "image" || u.K == "island" {
 			at["src"] = c.imageSrc(u)
@@ -291,6 +297,9 @@ func (c *converter) textValue(n ndNode) (string, bool) {
 		if n.In == nil {
 			return "", true
 		}
+		if n.In.V != "" && !c.opt.MaskNodes && n.In.Type != "password" {
+			return c.text(n.In.V), true
+		}
 		if n.In.Len > 0 {
 			return strings.Repeat("•", min(n.In.Len, 40)), true
 		}
@@ -310,8 +319,17 @@ func joinText(t *ndText) string {
 	return b.String()
 }
 
+// hide turns a node that masked mode would hide into a mask block (for the
+// masked copy of a raw recording).
+func (c *converter) hide(n *ndNode) {
+	if c.opt.MaskNodes && n.Masked {
+		n.K, n.C, n.Tx, n.Img, n.In = "mask", nil, nil, nil, nil
+	}
+}
+
 // node converts a native node and its subtree.
 func (c *converter) node(n ndNode) map[string]any {
+	c.hide(&n)
 	attrs := map[string]any{"style": c.css(n)}
 	if n.Role != "" {
 		attrs["data-role"] = n.Role
@@ -426,7 +444,7 @@ func (c *converter) css(n ndNode) string {
 		b.WriteString("display:flex;align-items:center;padding:0 8px;white-space:nowrap;overflow:hidden;")
 		b.WriteString("font:15px " + fontStack("") + ";")
 		if n.In != nil {
-			if n.In.Len == 0 {
+			if n.In.Len == 0 && (n.In.V == "" || c.opt.MaskNodes) {
 				b.WriteString("color:#9ca3af;")
 			}
 			if n.In.Focus {

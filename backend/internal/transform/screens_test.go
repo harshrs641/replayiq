@@ -19,7 +19,7 @@ func TestConvertMobileEvents(t *testing.T) {
 		{Type: 5, Subtype: "screen", Timestamp: 50}, // no image: dropped
 		{Type: 5, Subtype: "click", Selector: `button:"Pay now"`, Timestamp: 41},
 	}
-	out := convertScreens(in)
+	out := convertScreens(in, Options{})
 	types := make([]int, len(out))
 	for i, e := range out {
 		types[i] = e.Type

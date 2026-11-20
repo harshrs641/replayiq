@@ -3,6 +3,12 @@
  * Implements the ReplayIQ Recording API v1 (docs/sdk/recording-api-v1.md).
  */
 
+import { createNetworkCapture, consoleEvent, interceptConsole } from './capture.js';
+import { makeRedactor } from './redact.js';
+
+// The SDK's own debug output must not be recorded as the app's console.
+const sdkLog = typeof console !== 'undefined' ? console.log.bind(console) : () => {};
+
 // Replaced at build time (build.mjs).
 /* global __SDK_VERSION__, __UMD__ */
 const SDK_VERSION = typeof __SDK_VERSION__ !== 'undefined' ? __SDK_VERSION__ : 'dev';
@@ -131,6 +137,9 @@ async function gzip(text) {
 }
 
 // ─── PII Masking ─────────────────────────────────────────────────────────────
+// Masked in the browser in both data modes (Recording API v1.2 §4).
+const ALWAYS_MASKED_INPUTS = 'input[type="password"],input[name*="card"],input[name*="cvv"],input[name*="cvc"],input[autocomplete^="cc-"]';
+
 const PII_SELECTORS = [
   'input[type="password"]',
   'input[type="email"]',
@@ -148,63 +157,6 @@ function buildBlockClass(custom = []) {
   return classes.length === 1
     ? classes[0]
     : new RegExp(classes.map(c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'));
-}
-
-// ─── Network Capture ─────────────────────────────────────────────────────────
-function interceptNetwork(onEvent, isOwnRequest) {
-  const origFetch = window.fetch;
-  const origXHR = window.XMLHttpRequest.prototype.open;
-
-  window.fetch = async function (...args) {
-    const start = Date.now();
-    const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
-    const method = args[1]?.method || args[0]?.method || 'GET';
-    if (isOwnRequest(url)) return origFetch.apply(this, args);
-    try {
-      const res = await origFetch.apply(this, args);
-      onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'network', method, url, status: res.status, duration: Date.now() - start, timestamp: Date.now() });
-      return res;
-    } catch (err) {
-      onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'network', method, url, status: 0, error: err.message, duration: Date.now() - start, timestamp: Date.now() });
-      throw err;
-    }
-  };
-
-  window.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this._riq_method = method;
-    this._riq_url = url;
-    this._riq_start = Date.now();
-    if (!isOwnRequest(String(url))) {
-      this.addEventListener('loadend', () => {
-        onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'network', method: this._riq_method, url: this._riq_url, status: this.status, duration: Date.now() - this._riq_start, timestamp: Date.now() });
-      });
-    }
-    return origXHR.apply(this, [method, url, ...rest]);
-  };
-}
-
-// ─── Console / error capture ─────────────────────────────────────────────────
-function stackOf(err) {
-  // Stacks can be long (minified bundles); keep enough to locate the frame.
-  return err && typeof err.stack === 'string' ? err.stack.slice(0, 4000) : undefined;
-}
-
-function interceptConsole(onEvent) {
-  ['error', 'warn'].forEach(level => {
-    const orig = console[level].bind(console);
-    console[level] = function (...args) {
-      const err = args.find(a => a instanceof Error);
-      onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'console', level, message: args.map(String).join(' '), stack: stackOf(err), timestamp: Date.now() });
-      orig(...args);
-    };
-  });
-  window.addEventListener('error', e => {
-    onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'js_error', message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno, stack: stackOf(e.error), timestamp: Date.now() });
-  });
-  window.addEventListener('unhandledrejection', e => {
-    const r = e.reason;
-    onEvent({ type: EVENT_TYPE_CUSTOM, subtype: 'js_error', message: 'Unhandled rejection: ' + (r && r.message ? r.message : String(r)), stack: stackOf(r), timestamp: Date.now() });
-  });
 }
 
 // ─── Clicks, rage clicks, inputs, navigation ─────────────────────────────────
@@ -269,7 +221,19 @@ class ReplayIQSDK {
       rrwebUrl: config.rrwebUrl,
       debug: !!config.debug,
       metadata: config.metadata || {},
+      // Recording API v1.2: masked (default) or raw, and what to capture.
+      dataMode: config.dataMode === 'raw' ? 'raw' : 'masked',
+      capture: { replay: true, console: true, network: true, networkBodies: true, ...(config.capture || {}) },
+      network: { maxBodyBytes: 65536, ignoreUrls: [], redactHeaders: [], maskBodyKeys: [], ...(config.network || {}) },
     };
+    this.redact = makeRedactor(this.config.network);
+    // A session has one data mode: a page load in another mode starts a
+    // new session rather than mixing raw and masked batches.
+    if (getItem('session', '__riq_mode') !== this.config.dataMode) {
+      setItem('session', '__riq_sid', generateId());
+      setItem('session', '__riq_seq', '0');
+      setItem('session', '__riq_mode', this.config.dataMode);
+    }
     this.sessionId = getOrCreate('session', '__riq_sid');
     this.userId = getItem('local', '__riq_user') || getOrCreate('local', '__riq_uid');
     this.events = [];
@@ -293,7 +257,18 @@ class ReplayIQSDK {
   }
 
   log(...args) {
-    if (this.config.debug) console.log('[ReplayIQ]', ...args);
+    if (this.config.debug) sdkLog('[ReplayIQ]', ...args);
+  }
+
+  /** ReplayIQ.log: a console line from code (level: debug|info|log|warn|error). */
+  logLine(message, level = 'log', data) {
+    const args = data === undefined ? [message] : [message, data];
+    this._push(consoleEvent(level, args, this.redact));
+  }
+
+  _ignoreUrl(url) {
+    if (this._isOwnRequest(url)) return true;
+    return this.config.network.ignoreUrls.some(p => (p instanceof RegExp ? p.test(url) : String(url).startsWith(p)));
   }
 
   getSessionId() {
@@ -347,7 +322,7 @@ class ReplayIQSDK {
       screen_width: screen.width,
       screen_height: screen.height,
       sdk_version: SDK_NAME,
-      metadata: { platform: 'web', ...this.config.metadata },
+      metadata: { platform: 'web', data_mode: this.config.dataMode, ...this.config.metadata },
       started_at: new Date(this.sessionStarted).toISOString(),
     }, { keepalive: true }).catch(e => this.log('Session init error:', e));
   }
@@ -404,6 +379,7 @@ class ReplayIQSDK {
       project_id: this.config.projectId || undefined,
       batch_id: batch.id,
       platform: 'web',
+      data_mode: this.config.dataMode,
       sdk: SDK_NAME,
       events: batch.events,
       custom_events: batch.custom || [],
@@ -471,11 +447,17 @@ class ReplayIQSDK {
     this._initSession();
     this._startFlushLoop();
     const push = e => this._push(e);
-    interceptNetwork(push, url => this._isOwnRequest(url));
-    interceptConsole(push);
+    const { capture } = this.config;
+    this.net = createNetworkCapture({
+      bodies: capture.networkBodies, maxBodyBytes: this.config.network.maxBodyBytes,
+      ignore: url => this._ignoreUrl(url), redact: this.redact, emit: push,
+    }, capture.network);
+    if (capture.console) interceptConsole(push, this.redact);
     detectBehaviors(push);
     watchNavigation(push);
     this._watchActivity();
+    if (!capture.replay) return true;
+    if (this.config.dataMode === 'raw') this._tagMaskedElements();
     whenIdle(() => {
       loadRecorder(this.config)
         .then(rrweb => { this.rrweb = rrweb; this._record(); })
@@ -492,9 +474,20 @@ class ReplayIQSDK {
         this.events.push(event);
         if (this.events.length >= BATCH_SIZE) this._flush();
       },
-      blockClass: buildBlockClass(this.config.maskSelectors),
-      maskInputOptions: { password: true, email: false },
-      maskInputSelector: PII_SELECTORS.join(','),
+      ...(this.config.dataMode === 'raw'
+        ? {
+          // Raw: record what masked mode would hide (tagged data-riq-masked
+          // for the server's masked copy); passwords and card fields stay
+          // masked in the browser (always masked).
+          blockClass: 'riq-never-blocked',
+          maskInputOptions: { password: true },
+          maskInputSelector: ALWAYS_MASKED_INPUTS,
+        }
+        : {
+          blockClass: buildBlockClass(this.config.maskSelectors),
+          maskInputOptions: { password: true, email: false },
+          maskInputSelector: PII_SELECTORS.join(','),
+        }),
       collectFonts: true,
       recordCanvas: false,
       // Keyframes (Meta + FullSnapshot) that replay can start from: at
@@ -502,6 +495,23 @@ class ReplayIQSDK {
       checkoutEveryNth: 200,
       checkoutEveryNms: 30000,
     });
+  }
+
+  // Raw mode: mark elements masked mode would block or mask, so the
+  // server's masked copy can hide them; new elements are marked as added.
+  _tagMaskedElements() {
+    const classes = ['riq-mask', ...this.config.maskSelectors].map(c => '.' + CSS.escape(c));
+    const selector = [...PII_SELECTORS, ...classes].join(',');
+    const tag = root => {
+      try {
+        if (root.matches && root.matches(selector)) root.setAttribute('data-riq-masked', '');
+        root.querySelectorAll && root.querySelectorAll(selector).forEach(el => el.setAttribute('data-riq-masked', ''));
+      } catch (e) { /* invalid custom selector */ }
+    };
+    tag(document.documentElement);
+    new MutationObserver(list => {
+      for (const m of list) m.addedNodes.forEach(n => { if (n.nodeType === 1) tag(n); });
+    }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
   // Stops observing the DOM (a hidden or abandoned tab can keep mutating
@@ -573,7 +583,8 @@ const ReplayIQ = {
    * whether this session is recorded).
    *   ReplayIQ.init({ endpoint: 'https://ingest.example.com', key: '<ingest key>' })
    */
-  init(config) {
+  init(keyOrConfig, options) {
+    const config = typeof keyOrConfig === 'string' ? { ...(options || {}), key: keyOrConfig } : keyOrConfig;
     if (typeof window === 'undefined') return Promise.reject(new Error('ReplayIQ requires a browser environment'));
     if (!config || !(config.key || config.projectId)) return Promise.reject(new Error('ReplayIQ.init: `key` is required'));
     if (this._instance) return Promise.resolve(this._instance);
@@ -583,6 +594,24 @@ const ReplayIQ = {
   },
 
   identify(userId, traits) { this._instance?.identify(userId, traits); },
+
+  /** A console line from code: level debug | info | log | warn | error; data: any object. */
+  log(message, level = 'log', data) { this._instance?.logLine(message, level, data); },
+
+  /** An error from code, with its stack (console level "error"). */
+  logError(error, data) {
+    const e = error instanceof Error ? error : new Error(String(error));
+    this._instance?._push(consoleEvent('error', data === undefined ? [e] : [e, data], this._instance.redact));
+  },
+
+  /** Records a request made by any client: { method, url, status, duration, request, response, timing, error }. */
+  recordNetwork(entry) { this._instance?.net?.record({ initiator: 'manual', ...entry }); },
+
+  /** A fetch that is always recorded, even with capture.network off. */
+  fetch(input, init) {
+    return this._instance?.net ? this._instance.net.recordingFetch(input, init) : fetch(input, init);
+  },
+
   track(name, properties) { this._instance?.track(name, properties); },
   stop() { this._instance?.stop(); },
   getSessionId() { return this._instance?.sessionId; },

@@ -54,7 +54,7 @@ func HasScreenFrames(b *models.EventBatch) bool {
 
 // convertMobileEvents rewrites screen/touch events into rrweb events and
 // passes every other event through.
-func convertScreens(events []models.RRWebEvent) []models.RRWebEvent {
+func convertScreens(events []models.RRWebEvent, opt Options) []models.RRWebEvent {
 	out := make([]models.RRWebEvent, 0, len(events)+4)
 	for _, e := range events {
 		if e.Type != 5 {
@@ -65,6 +65,9 @@ func convertScreens(events []models.RRWebEvent) []models.RRWebEvent {
 		case "screen":
 			if e.Image == "" {
 				continue
+			}
+			if opt.MaskNodes {
+				e.Image = paintMaskRects(e)
 			}
 			if e.Keyframe {
 				out = append(out,

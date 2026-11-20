@@ -194,8 +194,10 @@ type replaySource struct {
 func (s replaySource) Masked() bool { return s.MaskedBucket || s.DeviceMasked }
 
 func (r *router) replaySourceFor(ctx context.Context, sessionID string, masked bool) replaySource {
-	if masked && !r.cfg.MinIO.HasMaskedEvents(ctx, sessionID) && r.cfg.MinIO.IsDeviceMasked(ctx, sessionID) {
-		// No masked copy is ever written for these; don't wait for one.
+	if r.cfg.MinIO.IsDeviceMasked(ctx, sessionID) {
+		// One copy, masked on the device (data_mode "masked"): no masked
+		// copy is ever written and there is no unmasked view, whichever
+		// was asked for.
 		return replaySource{DeviceMasked: true}
 	}
 	return replaySource{MaskedBucket: r.useMaskedCopy(ctx, sessionID, masked)}

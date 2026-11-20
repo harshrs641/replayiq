@@ -62,3 +62,48 @@ func TestProcessConvertsMobileAndMasksWeb(t *testing.T) {
 		t.Fatal("web batches get a raw and a masked copy")
 	}
 }
+
+func TestRawModeKeepsRawAndMaskedCopiesApart(t *testing.T) {
+	pub := &fakePublisher{}
+	p := &Processor{Masking: masking.DefaultConfig(nil), Tracker: masking.NewTracker(), Publisher: pub, PublicAPIURL: "https://api.test"}
+	var b models.EventBatch
+	json.Unmarshal([]byte(`{"session_id":"r1","project_id":"acme","data_mode":"raw","events":[
+	  {"type":5,"subtype":"ui_snapshot","timestamp":1,"width":10,"height":10,
+	   "root":{"id":1,"k":"view","f":[0,0,10,10],"c":[{"id":2,"k":"input","f":[0,0,10,5],"in":{"type":"email","v":"jane@acme.com"}}]}},
+	  {"type":5,"subtype":"network","timestamp":2,"method":"POST","url":"https://api.test/x",
+	   "request":{"headers":{"authorization":"Bearer S","x-user":"jane@acme.com"},"body":"{\"password\":\"p\",\"email\":\"jane@acme.com\"}"}}]}`), &b)
+	if err := p.Process(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(pub.sent[kafka.TopicEventsRaw][0])
+	masked, _ := json.Marshal(pub.sent[kafka.TopicEventsMasked][0])
+	if !strings.Contains(string(raw), "jane@acme.com") {
+		t.Fatalf("raw copy must keep the recorded values: %s", raw)
+	}
+	if strings.Contains(string(masked), "jane@acme.com") {
+		t.Fatalf("masked copy leaked: %s", masked)
+	}
+	for _, copy := range []string{string(raw), string(masked)} {
+		if strings.Contains(copy, "Bearer S") || strings.Contains(copy, `\"p\"`) {
+			t.Fatalf("always-masked data stored: %s", copy)
+		}
+	}
+	if pub.sent[kafka.TopicEventsRaw][0].DeviceMasked {
+		t.Fatal("raw sessions are not device-masked: the dashboard offers both views")
+	}
+}
+
+func TestWebMaskedModeStoresOneCopy(t *testing.T) {
+	pub := &fakePublisher{}
+	p := &Processor{Masking: masking.DefaultConfig(nil), Tracker: masking.NewTracker(), Publisher: pub}
+	var b models.EventBatch
+	json.Unmarshal([]byte(`{"session_id":"w2","project_id":"acme","data_mode":"masked","events":[{"type":5,"subtype":"console","level":"info","message":"hi jane@acme.com","timestamp":1}]}`), &b)
+	p.Process(context.Background(), b)
+	if len(pub.sent[kafka.TopicEventsMasked]) != 0 || len(pub.sent[kafka.TopicEventsRaw]) != 1 {
+		t.Fatal("masked mode: one copy only")
+	}
+	out, _ := json.Marshal(pub.sent[kafka.TopicEventsRaw][0])
+	if strings.Contains(string(out), "jane@acme.com") || !pub.sent[kafka.TopicEventsRaw][0].DeviceMasked {
+		t.Fatalf("the one copy is the masked one: %s", out)
+	}
+}

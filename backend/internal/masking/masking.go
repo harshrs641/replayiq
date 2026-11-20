@@ -302,6 +302,11 @@ func isSensitiveNode(node map[string]any, cfg Config) bool {
 	if _, ok := attrs["data-riq-mask"]; ok {
 		return true
 	}
+	// Raw recordings (Recording API v1.2) record what masked mode would
+	// block, marked so the server's masked copy blocks it.
+	if _, ok := attrs["data-riq-masked"]; ok {
+		return true
+	}
 	for _, key := range []string{"name", "id", "autocomplete"} {
 		s, ok := attrs[key].(string)
 		if !ok {

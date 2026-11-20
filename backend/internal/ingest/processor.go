@@ -46,7 +46,24 @@ func (p *Processor) AssetURL(projectID, hash string) string {
 }
 
 // Process handles one batch as received from an SDK.
+//
+// What is stored depends on the batch's data mode (Recording API v1.2 §4):
+//
+//	masked (or v1 device_masked): one copy, masked; no unmasked view
+//	raw: a raw copy and a server-built masked copy
+//	none given (older web SDKs): raw + masked, as before
+//
+// The always-masked rules (secrets, card numbers) apply to every copy.
 func (p *Processor) Process(ctx context.Context, batch models.EventBatch) error {
+	for i := range batch.Events {
+		masking.ApplyAlways(&batch.Events[i])
+	}
+	mode := batch.DataMode
+	if mode == "" && batch.DeviceMasked {
+		mode = "masked"
+	}
+
+	var masked *models.EventBatch
 	if transform.NeedsTransform(&batch) {
 		// Keep what the SDK sent: the conversion can be improved and re-run.
 		if p.MinIO != nil {
@@ -55,19 +72,38 @@ func (p *Processor) Process(ctx context.Context, batch models.EventBatch) error 
 			}
 		}
 		project := batch.ProjectID
-		batch.Events = transform.Events(batch.Events, transform.Options{
+		opt := transform.Options{
 			AssetURL: func(hash string) string { return p.AssetURL(project, hash) },
 			MaskText: func(s string) string { return masking.MaskText(s, p.Masking) },
-		})
-	}
-
-	// Device-masked batches (mobile) keep one copy with their free text
-	// redacted; web batches get a second, DOM-masked copy.
-	var masked *models.EventBatch
-	if batch.DeviceMasked {
-		batch = *masking.MaskTextFields(&batch, p.Masking)
+		}
+		if mode == "raw" {
+			// Raw copy: as recorded (card numbers still redacted); masked copy
+			// built here: flagged nodes and screenshot areas hidden.
+			maskedOpt := opt
+			maskedOpt.MaskNodes = true
+			m := batch
+			m.Events = transform.Events(batch.Events, maskedOpt)
+			m.DeviceMasked = false
+			masked = maskCopy(&m, p.Masking)
+			rawOpt := opt
+			rawOpt.MaskText = masking.RedactCards
+			batch.Events = transform.Events(batch.Events, rawOpt)
+			batch.DeviceMasked = false
+		} else {
+			batch.Events = transform.Events(batch.Events, opt)
+			batch.DeviceMasked = true
+			batch = *maskCopy(&batch, p.Masking)
+		}
 	} else {
-		masked = masking.MaskBatch(p.Tracker, &batch, p.Masking)
+		switch mode {
+		case "masked":
+			// Web, masked mode: only the masked copy is kept.
+			batch = *masking.MaskBatch(p.Tracker, &batch, p.Masking)
+			batch = *maskCopy(&batch, p.Masking)
+			batch.DeviceMasked = true
+		default:
+			masked = maskCopy(masking.MaskBatch(p.Tracker, &batch, p.Masking), p.Masking)
+		}
 	}
 
 	if p.Publisher != nil {
@@ -90,4 +126,14 @@ func (p *Processor) Process(ctx context.Context, batch models.EventBatch) error 
 		}
 	}
 	return nil
+}
+
+// maskCopy applies the text masking of a masked copy: free-text fields,
+// network headers and bodies, console arguments.
+func maskCopy(b *models.EventBatch, cfg masking.Config) *models.EventBatch {
+	out := masking.MaskTextFields(b, cfg)
+	for i := range out.Events {
+		masking.ScrubNetworkConsole(&out.Events[i], cfg)
+	}
+	return out
 }

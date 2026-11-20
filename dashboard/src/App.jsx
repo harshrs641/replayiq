@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react";
 import RRWebPlayer from "rrweb-player";
 import "rrweb-player/dist/style.css";
 
@@ -670,14 +670,14 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest, onActivity
           </button>
         )}
         {manifest?.device_masked ? (
-          // Mobile: pixels were masked on the phone before upload, so there
-          // is no unmasked copy to switch to.
-          <span title="Masked on the device before upload (mobile recording). There is no unmasked copy." style={{
+          // Recorded with dataMode "masked": only masked data left the
+          // device or browser, so there is no unmasked copy to switch to.
+          <span title='Recorded with dataMode "masked": rendering, console and network were masked in the app before upload. There is no unmasked copy. Record with dataMode "raw" to get a Masked / Unmasked switch.' style={{
             display: "flex", alignItems: "center", gap: 6,
             padding: "5px 12px", borderRadius: 6, fontSize: 11, fontWeight: 600,
             border: `1px solid ${C.border}`, color: C.textMuted,
           }}>
-            <span>🔒</span>Masked on device
+            <span>🔒</span>Masked at source
           </span>
         ) : (
         <button
@@ -845,7 +845,7 @@ function buildActivity(events, sessionStart) {
         behaviour.push({ ts, at, kind: "input", label: "Input", detail: e.selector });
         break;
       case "console":
-        consoleLogs.push({ ts, at, level: e.level || "log", message: e.message, stack: e.stack });
+        consoleLogs.push({ ts, at, level: e.level || "log", message: e.message, stack: e.stack, args: e.args, source: e.source, logger: e.logger });
         break;
       case "js_error":
         consoleLogs.push({
@@ -854,7 +854,10 @@ function buildActivity(events, sessionStart) {
         });
         break;
       case "network":
-        network.push({ ts, at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration, error: e.error });
+        network.push({
+          ts, at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration, error: e.error,
+          request: e.request, response: e.response, timing: e.timing, protocol: e.protocol, cached: e.cached, initiator: e.initiator,
+        });
         break;
       default: {
         // Mobile signals (Recording API v1.1).
@@ -929,6 +932,100 @@ function signalRow(e) {
   }
 }
 
+const CONSOLE_LEVELS = ["debug", "info", "log", "warn", "error"];
+
+function pretty(v) {
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (t.startsWith("{") || t.startsWith("[")) { try { return JSON.stringify(JSON.parse(t), null, 2); } catch (e) { /* not JSON */ } }
+    return v;
+  }
+  try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); }
+}
+
+function shellQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+
+// A cURL command for a recorded request. Redacted header values are left
+// out rather than sent as "[redacted]".
+function toCurl(r) {
+  const parts = ["curl", shellQuote(r.url)];
+  if (r.method && r.method !== "GET") parts.push("-X", r.method);
+  for (const [k, v] of Object.entries(r.request?.headers || {})) {
+    if (v === "[redacted]") continue;
+    parts.push("-H", shellQuote(`${k}: ${v}`));
+  }
+  if (r.request?.body) parts.push("--data-raw", shellQuote(r.request.body));
+  return parts.join(" ");
+}
+
+function NetworkDetail({ r }) {
+  const [copied, setCopied] = useState(false);
+  const mono = { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" };
+  const h = { fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: C.textFaint, margin: "12px 0 4px" };
+  const kv = obj => Object.entries(obj || {});
+  const Headers = ({ obj }) => kv(obj).length === 0
+    ? <div style={{ fontSize: 11, color: C.textFaint }}>None recorded</div>
+    : <table style={{ borderCollapse: "collapse", width: "100%" }}><tbody>
+        {kv(obj).map(([k, v]) => (
+          <tr key={k}>
+            <td style={{ ...mono, fontSize: 11, color: C.textMuted, padding: "1px 10px 1px 0", verticalAlign: "top", whiteSpace: "nowrap" }}>{k}</td>
+            <td style={{ ...mono, fontSize: 11, color: v === "[redacted]" ? C.textFaint : C.text, wordBreak: "break-all" }}>{String(v)}</td>
+          </tr>))}
+      </tbody></table>;
+  const Body = ({ side }) => {
+    if (!side) return null;
+    if (side.body == null || side.body === "") {
+      return <div style={{ fontSize: 11, color: C.textFaint }}>{side.size ? `Not captured (${side.size} bytes, non-text or bodies off)` : "Empty"}</div>;
+    }
+    return <>
+      <pre style={{ ...mono, fontSize: 11, color: C.text, background: C.bgSubtle, border: `1px solid ${C.border}`, borderRadius: 4, padding: 8, margin: 0, maxHeight: 240, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{pretty(side.body)}</pre>
+      {side.truncated && <div style={{ fontSize: 10, color: C.textFaint, marginTop: 2 }}>Truncated at the SDK's body limit{side.size ? ` (${side.size} bytes in all)` : ""}</div>}
+    </>;
+  };
+  const t = r.timing || {};
+  const phases = [["dns", "DNS"], ["connect", "Connect"], ["tls", "TLS"], ["ttfb", "Waiting (TTFB)"], ["download", "Download"]].filter(([k]) => t[k] != null);
+  const total = phases.reduce((a, [k]) => a + t[k], 0) || 1;
+  const facts = [
+    ["Status", r.status || "failed"], ["Duration", r.duration == null ? "—" : dur(r.duration)],
+    ["Protocol", r.protocol], ["Initiator", r.initiator], ["Cache", r.cached ? "served from cache" : r.cached === false ? "network" : null],
+    ["Response size", r.response?.size != null ? `${r.response.size} B` : null],
+  ].filter(([, v]) => v != null && v !== "");
+  return (
+    <div onClick={e => e.stopPropagation()} style={{ padding: "4px 14px 14px", background: C.bg, cursor: "default" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginTop: 8 }}>
+        <div style={{ ...mono, fontSize: 11, color: C.text, wordBreak: "break-all" }}><b>{r.method}</b> {r.url}</div>
+        <button onClick={() => { navigator.clipboard?.writeText(toCurl(r)); setCopied(true); setTimeout(() => setCopied(false), 1500); }} style={{
+          flexShrink: 0, fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 4, cursor: "pointer",
+          border: `1px solid ${C.borderStrong}`, background: "transparent", color: C.textMuted,
+        }}>{copied ? "✓ Copied" : "Copy as cURL"}</button>
+      </div>
+      {r.error && <div style={{ fontSize: 11, color: C.text, marginTop: 6 }}>Error: {r.error}</div>}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 18px", marginTop: 8 }}>
+        {facts.map(([k, v]) => <div key={k} style={{ fontSize: 11 }}><span style={{ color: C.textFaint }}>{k} </span><span style={{ color: C.text }}>{v}</span></div>)}
+      </div>
+      {phases.length > 0 && <>
+        <div style={h}>Timing</div>
+        <div style={{ display: "flex", height: 8, borderRadius: 2, overflow: "hidden", background: C.bgSubtle }}>
+          {phases.map(([k], i) => <div key={k} title={`${k}: ${t[k]} ms`} style={{ width: `${(t[k] / total) * 100}%`, background: ["#d4d4d8", "#a1a1aa", "#71717a", "#3f3f46", "#18181b"][i % 5] }} />)}
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 14px", marginTop: 4 }}>
+          {phases.map(([k, label]) => <span key={k} style={{ fontSize: 11, color: C.textMuted }}>{label} <span style={{ ...mono, color: C.text }}>{t[k]} ms</span></span>)}
+        </div>
+      </>}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16 }}>
+        <div>
+          <div style={h}>Request headers</div><Headers obj={r.request?.headers} />
+          <div style={h}>Request body</div>{r.request ? <Body side={r.request} /> : <div style={{ fontSize: 11, color: C.textFaint }}>Not recorded</div>}
+        </div>
+        <div>
+          <div style={h}>Response headers</div><Headers obj={r.response?.headers} />
+          <div style={h}>Response body</div>{r.response ? <Body side={r.response} /> : <div style={{ fontSize: 11, color: C.textFaint }}>Not recorded</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const ACTIVITY_TABS = [
   { key: "behaviour", label: "Behaviour" },
   { key: "console", label: "Console" },
@@ -938,6 +1035,9 @@ const ACTIVITY_TABS = [
 function ActivityPanel({ events, start, currentTime, onSeek }) {
   const [tab, setTab] = useState("behaviour");
   const [errorsOnly, setErrorsOnly] = useState(false);
+  const [levels, setLevels] = useState(() => new Set(CONSOLE_LEVELS));
+  const [query, setQuery] = useState("");
+  const [openRow, setOpenRow] = useState(null);
   const activity = useMemo(() => buildActivity(events || [], start), [events, start]);
 
   const errorCount = {
@@ -952,6 +1052,13 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
       tab === "behaviour" ? (r.kind === "rage_click" || r.strong)
       : tab === "console" ? r.level === "error" || r.level === "exception"
       : !r.status || r.status >= 400);
+  }
+  if (tab === "console") rows = rows.filter(r => levels.has(r.level === "exception" ? "error" : r.level === "trace" ? "debug" : r.level));
+  const q = query.trim().toLowerCase();
+  if (q && tab !== "behaviour") {
+    rows = rows.filter(r => (tab === "console"
+      ? `${r.message || ""} ${r.logger || ""} ${r.source || ""}`
+      : `${r.method} ${r.url || ""} ${r.status || ""}`).toLowerCase().includes(q));
   }
   // Last row at or before the playhead, highlighted as "now".
   let activeIdx = -1;
@@ -992,15 +1099,33 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
         </label>
       </div>
 
-      <div style={{ maxHeight: 320, overflowY: "auto" }}>
+      {tab !== "behaviour" && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: `1px solid ${C.border}`, flexWrap: "wrap" }}>
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder={tab === "console" ? "Filter messages" : "Filter URL, method, status"}
+            style={{ flex: "1 1 160px", minWidth: 120, fontSize: 11, padding: "4px 8px", border: `1px solid ${C.border}`, borderRadius: 4, background: "transparent", color: C.text }} />
+          {tab === "console" && CONSOLE_LEVELS.map(l => {
+            const on = levels.has(l);
+            const n = activity.console.filter(c => (c.level === "exception" ? "error" : c.level === "trace" ? "debug" : c.level) === l).length;
+            return (
+              <button key={l} onClick={() => setLevels(prev => { const s = new Set(prev); s.has(l) ? s.delete(l) : s.add(l); return s; })} style={{
+                fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", cursor: "pointer",
+                padding: "3px 8px", borderRadius: 4, border: `1px solid ${on ? C.ink : C.border}`,
+                background: on ? C.ink : "transparent", color: on ? "#fff" : C.textMuted,
+              }}>{l} <span style={{ opacity: 0.7 }}>{n}</span></button>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ maxHeight: 420, overflowY: "auto" }}>
         {events === null ? (
           <div style={{ padding: 20, fontSize: 12, color: C.textMuted, textAlign: "center" }}>Loading activity…</div>
         ) : rows.length === 0 ? (
           <div style={{ padding: 20, fontSize: 12, color: C.textFaint, textAlign: "center" }}>
             {errorsOnly ? "Nothing matches this filter." : {
               behaviour: "No clicks, inputs or navigation captured.",
-              console: "No console warnings or errors captured.",
-              network: "No network requests captured (the mobile SDK does not record them yet).",
+              console: "No console logs captured.",
+              network: "No network requests captured.",
             }[tab]}
           </div>
         ) : (
@@ -1011,7 +1136,9 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
                   : tab === "network" ? (!r.status || r.status >= 400)
                   : r.strong;
                 return (
-                  <tr key={i} onClick={() => onSeek?.(r.ts)} title="Jump to this moment in the replay" style={{
+                  <Fragment key={i}>
+                  <tr onClick={() => { onSeek?.(r.ts); if (tab === "network") setOpenRow(openRow === r ? null : r); }}
+                    title={tab === "network" ? "Jump to this moment and show request details" : "Jump to this moment in the replay"} style={{
                     cursor: "pointer", borderBottom: `1px solid ${C.border}`,
                     background: i === activeIdx ? C.bgHover : "transparent",
                     boxShadow: isError ? `inset 3px 0 0 ${C.ink}` : "none",
@@ -1026,8 +1153,15 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
                     {tab === "console" && <>
                       <td style={{ ...cell, width: 80, fontWeight: isError ? 700 : 600, color: isError ? C.text : C.textMuted, textTransform: "uppercase", fontSize: 10, letterSpacing: "0.04em" }}>{r.level}</td>
                       <td style={{ ...cell, ...mono, color: C.text, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                        {r.logger && <span style={{ fontSize: 10, color: C.textFaint, marginRight: 6 }}>[{r.logger}]</span>}
                         {r.message}
                         {r.source && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>at {r.source}</div>}
+                        {r.args != null && (
+                          <details onClick={e => e.stopPropagation()} style={{ marginTop: 4 }}>
+                            <summary style={{ fontSize: 11, color: C.textMuted, cursor: "pointer" }}>Arguments</summary>
+                            <pre style={{ ...mono, fontSize: 11, color: C.textMuted, whiteSpace: "pre-wrap", margin: "4px 0 0", maxHeight: 200, overflow: "auto" }}>{pretty(r.args)}</pre>
+                          </details>
+                        )}
                         {r.stack && (
                           // Clicking the stack toggles it; it must not also seek.
                           <details onClick={e => e.stopPropagation()} style={{ marginTop: 4 }}>
@@ -1047,6 +1181,10 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
                       <td style={{ ...cell, ...mono, width: 70, textAlign: "right", color: C.textFaint }}>{r.duration == null ? "—" : r.duration === 0 ? "0ms" : dur(r.duration)}</td>
                     </>}
                   </tr>
+                  {tab === "network" && openRow === r && (
+                    <tr><td colSpan={5} style={{ padding: 0, borderBottom: `1px solid ${C.border}` }}><NetworkDetail r={r} /></td></tr>
+                  )}
+                  </Fragment>
                 );
               })}
             </tbody>

@@ -50,8 +50,14 @@ func (r *router) handleEvents(w http.ResponseWriter, req *http.Request) {
 	}
 	// Mobile recordings (screenshots or Native DOM) can only be masked on
 	// the device.
-	if transform.NeedsTransform(&batch) && !batch.DeviceMasked {
-		writeError(w, http.StatusBadRequest, "mobile recordings must set device_masked: masking happens on the device")
+	if batch.DataMode != "" && batch.DataMode != "masked" && batch.DataMode != "raw" {
+		writeError(w, http.StatusBadRequest, `data_mode must be "masked" or "raw"`)
+		return
+	}
+	// Mobile recordings say how they were masked: on the device (masked /
+	// v1 device_masked) or not at all (raw, the server builds the masked copy).
+	if transform.NeedsTransform(&batch) && !batch.DeviceMasked && batch.DataMode != "raw" {
+		writeError(w, http.StatusBadRequest, `mobile recordings must set data_mode ("masked" or "raw") or device_masked`)
 		return
 	}
 

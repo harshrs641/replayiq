@@ -16,8 +16,12 @@ type Options struct {
 	// AssetURL returns where the player loads an uploaded asset (image,
 	// island, font) from, given its hash.
 	AssetURL func(hash string) string
-	// MaskText redacts PII patterns in UI text (labels, text nodes).
+	// MaskText redacts text in the UI (labels, text nodes, input values).
 	MaskText func(string) string
+	// MaskNodes builds the masked copy of a raw recording (v1.2): nodes
+	// flagged "masked" become mask blocks, input values are hidden, and
+	// screenshots get their mask_rects painted over.
+	MaskNodes bool
 }
 
 // NeedsTransform reports whether a batch has mobile events to convert.
@@ -41,7 +45,7 @@ func Events(events []models.RRWebEvent, opt Options) []models.RRWebEvent {
 	var screens []models.RRWebEvent
 	flushScreens := func() {
 		if len(screens) > 0 {
-			out = append(out, convertScreens(screens)...)
+			out = append(out, convertScreens(screens, opt)...)
 			screens = screens[:0]
 		}
 	}
