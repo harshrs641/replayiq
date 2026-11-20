@@ -3,11 +3,12 @@
 // exposing a single public endpoint on :8080 (GATEWAY_PORT to override).
 //
 // Routing rules:
-//   POST /api/v1/sessions          → ingest (create session)
-//   POST /api/v1/sessions/{id}/end → ingest
-//   POST /api/v1/sessions/{id}/analyze → ingest
-//   POST /api/v1/events            → ingest
-//   everything else                → query  (GETs, Jira POSTs, health, SDK)
+//
+//	POST /api/v1/sessions          → ingest (create session)
+//	POST /api/v1/sessions/{id}/end → ingest
+//	POST /api/v1/sessions/{id}/analyze → ingest
+//	POST /api/v1/events            → ingest
+//	everything else                → query  (GETs, Jira POSTs, health, SDK)
 //
 // This keeps the public API surface identical to the previous monolith so
 // the dashboard and SDK require no changes.
@@ -59,7 +60,7 @@ func isIngestPath(r *http.Request) bool {
 	}
 	p := r.URL.Path
 	// POST /api/v1/events
-	if p == "/api/v1/events" {
+	if p == "/api/v1/events" || p == "/api/v1/assets" {
 		return true
 	}
 	// POST /api/v1/sessions  (create)

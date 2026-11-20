@@ -3,6 +3,7 @@
 package api
 
 import (
+	"github.com/harshrs641/replayiq/internal/ingest"
 	"net/http"
 	"time"
 
@@ -52,6 +53,9 @@ type RouterConfig struct {
 	JiraConfig  JiraConfig
 	Masking     masking.Config
 	MaskTracker *masking.Tracker
+	// Ingest processes batches inline in the all-in-one server (Producer
+	// nil); built from MinIO/Masking/MaskTracker when unset.
+	Ingest *ingest.Processor
 	// AnalysisConcurrency caps simultaneous Ollama analysis jobs (monolith
 	// mode only).  Zero uses defaultAnalysisConcurrency.
 	AnalysisConcurrency int
@@ -121,12 +125,14 @@ func (r *router) ingestRoutes() {
 	r.mux.HandleFunc("/api/v1/sessions", r.handleSessions)
 	r.mux.HandleFunc("/api/v1/sessions/", r.handleSessionByID)
 	r.mux.HandleFunc("/api/v1/events", r.eventRateLimitMiddleware(r.handleEvents))
+	r.mux.HandleFunc("/api/v1/assets", r.uploadAsset)
 }
 
 // queryRoutes registers the read endpoints (session queries, replay, search,
 // issues, Jira, health, and SDK file serving).
 func (r *router) queryRoutes() {
 	r.mux.Handle("/sdk/", http.StripPrefix("/sdk/", http.FileServer(http.Dir(r.cfg.SDKPath))))
+	r.mux.HandleFunc("/api/v1/assets/", r.assetByPath)
 
 	for _, rt := range []struct {
 		pattern string

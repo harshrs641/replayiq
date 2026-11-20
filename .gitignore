@@ -23,3 +23,5 @@ dashboard/dist/
 
 # Claude Code session files
 .claude/
+sdk/web/node_modules/
+sdk/web/dist/

@@ -308,6 +308,10 @@ cmd_up() {
     env DATABASE_URL="$DB_URL" \
         INGEST_PORT=8081 \
         SDK_PATH="$SDK" \
+        MINIO_ENDPOINT="$MINIO_EP" \
+        MINIO_ACCESS_KEY="$MINIO_ACCESS_KEY" \
+        MINIO_SECRET_KEY="$MINIO_SECRET_KEY" \
+        MINIO_BUCKET="sessions" \
         KAFKA_BROKERS="$KAFKA_BROKERS" \
         nohup "$RUN_DIR/replayiq-ingest" > "$RUN_DIR/ingest.log" 2>&1 &
     echo $! > "$RUN_DIR/ingest.pid"
@@ -327,6 +331,8 @@ cmd_up() {
         OLLAMA_MODEL="$OLLAMA_MODEL" \
         EMBEDDING_MODEL="$EMBEDDING_MODEL" \
         KAFKA_BROKERS="$KAFKA_BROKERS" \
+        PUBLIC_API_URL="${PUBLIC_API_URL:-http://localhost:8080}" \
+        MASK_CLASSES="${MASK_CLASSES:-}" \
         nohup "$RUN_DIR/replayiq-processor" > "$RUN_DIR/processor.log" 2>&1 &
     echo $! > "$RUN_DIR/processor.pid"
   fi

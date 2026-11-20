@@ -329,6 +329,9 @@ func redact(s string) string {
 	return strings.Repeat("•", n)
 }
 
+// MaskText redacts PII patterns (emails, card numbers, ...) in s.
+func MaskText(s string, cfg Config) string { return maskText(s, cfg) }
+
 func maskText(s string, cfg Config) string {
 	for _, rule := range cfg.Rules {
 		s = rule.Pattern.ReplaceAllStringFunc(s, rule.Mask)

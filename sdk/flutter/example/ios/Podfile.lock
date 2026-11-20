@@ -1,0 +1,22 @@
+PODS:
+  - Flutter (1.0.0)
+  - replayiq_flutter (1.0.0):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - replayiq_flutter (from `.symlinks/plugins/replayiq_flutter/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  replayiq_flutter:
+    :path: ".symlinks/plugins/replayiq_flutter/ios"
+
+SPEC CHECKSUMS:
+  Flutter: 71a624a5bc0c04062bf19101d501e466baf2fb47
+  replayiq_flutter: 44cde4b53f6f643632f50efa0c743a0aa618c2b6
+
+PODFILE CHECKSUM: 3ba3a73b1b12adcf321a227a745625fe0888cc82
+
+COCOAPODS: 1.16.2

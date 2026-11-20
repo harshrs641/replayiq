@@ -8,15 +8,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/harshrs641/replayiq/internal/models"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/harshrs641/replayiq/internal/models"
 )
 
 // EmbeddingDims must match the embedding model configured via EMBEDDING_MODEL
@@ -28,8 +29,8 @@ import (
 // recall degrades.  For enterprise deployments above that threshold, migrate
 // vectors to a dedicated vector database:
 //
-//   Qdrant  (https://qdrant.tech)          — self-hosted, REST/gRPC, filtering
-//   Weaviate (https://weaviate.io)         — self-hosted, GraphQL, hybrid search
+//	Qdrant  (https://qdrant.tech)          — self-hosted, REST/gRPC, filtering
+//	Weaviate (https://weaviate.io)         — self-hosted, GraphQL, hybrid search
 //
 // Migration path:
 //  1. Stand up Qdrant/Weaviate alongside Postgres.
@@ -401,8 +402,8 @@ func (p *Postgres) CreateIssue(ctx context.Context, issue *models.AIIssue) error
 
 // SessionMoments is what grounding a session's AI findings needs.
 type SessionMoments struct {
-	Tokenized     string
-	Frustrations  []string
+	Tokenized      string
+	Frustrations   []string
 	FrustrationTS  []int64
 	FrustrationSrc []string
 	Issues         []*models.AIIssue
@@ -611,6 +612,12 @@ type MinIO struct {
 	// enterprise deployment (e.g. the raw bucket locked down to a narrow
 	// set of principals, the masked bucket open to general support staff).
 	maskedBucket string
+	// nativeBucket keeps mobile batches as the SDK sent them, before
+	// conversion to rrweb (package ingest), so the conversion can be re-run.
+	nativeBucket string
+	// assetBucket holds images, islands and fonts that Native DOM
+	// recordings reference by hash, per project.
+	assetBucket string
 }
 
 func NewMinIO(endpoint, accessKey, secretKey, bucket, maskedBucket string, secure bool) (*MinIO, error) {
@@ -623,12 +630,14 @@ func NewMinIO(endpoint, accessKey, secretKey, bucket, maskedBucket string, secur
 	}
 
 	ctx := context.Background()
-	for _, b := range []string{bucket, maskedBucket} {
+	m := &MinIO{client: client, bucket: bucket, maskedBucket: maskedBucket,
+		nativeBucket: bucket + "-native", assetBucket: bucket + "-assets"}
+	for _, b := range []string{bucket, maskedBucket, m.nativeBucket, m.assetBucket} {
 		if err := ensureBucket(ctx, client, b); err != nil {
 			return nil, err
 		}
 	}
-	return &MinIO{client: client, bucket: bucket, maskedBucket: maskedBucket}, nil
+	return m, nil
 }
 
 func ensureBucket(ctx context.Context, client *minio.Client, bucket string) error {
@@ -648,6 +657,12 @@ func (m *MinIO) StoreEvents(ctx context.Context, sessionID string, batch *models
 	return m.store(ctx, m.bucket, sessionID, batch)
 }
 
+// StoreNativeEvents keeps a batch exactly as the SDK sent it (mobile
+// recordings, before conversion to rrweb).
+func (m *MinIO) StoreNativeEvents(ctx context.Context, sessionID string, batch *models.EventBatch) (string, error) {
+	return m.store(ctx, m.nativeBucket, sessionID, batch)
+}
+
 // StoreMaskedEvents persists the redacted copy of batch (see package
 // masking) under the same key shape as StoreEvents, but in maskedBucket -
 // this is the "*_masked" view the replay toggle reads by default.
@@ -661,6 +676,9 @@ func (m *MinIO) StoreMaskedEvents(ctx context.Context, sessionID string, batch *
 // same millisecond produced the same key and the second PutObject silently
 // overwrote the first, quietly dropping events from storage.
 var storeKeySeq atomic.Uint64
+
+// batchIDRe: batch ids safe to use in an object key.
+var batchIDRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
 // store writes batch gzip-compressed. Event JSON compresses very well: rrweb
 // DOM payloads are repetitive, and mobile screenshot frames are near
@@ -676,8 +694,11 @@ func (m *MinIO) store(ctx context.Context, bucket, sessionID string, batch *mode
 	if err := zw.Close(); err != nil {
 		return "", err
 	}
-	seq := storeKeySeq.Add(1)
-	key := fmt.Sprintf("sessions/%s/%d-%d.json.gz", sessionID, time.Now().UnixMilli(), seq)
+	key := fmt.Sprintf("sessions/%s/%d-%d.json.gz", sessionID, time.Now().UnixMilli(), storeKeySeq.Add(1))
+	if batchIDRe.MatchString(batch.BatchID) {
+		// Recording API v1: a retried batch overwrites itself.
+		key = fmt.Sprintf("sessions/%s/b-%s.json.gz", sessionID, batch.BatchID)
+	}
 	// Time index for streaming replay (see replay_index.go).
 	headers := make([]eventHeader, len(batch.Events))
 	for i, e := range batch.Events {
@@ -729,10 +750,12 @@ func (m *MinIO) DeleteSessionMaskedEvents(ctx context.Context, sessionID string)
 // DeleteSessionEvents removes every stored object of a session, raw and
 // masked (retention).
 func (m *MinIO) DeleteSessionEvents(ctx context.Context, sessionID string) error {
-	if err := m.deletePrefix(ctx, m.bucket, sessionID); err != nil {
-		return err
+	for _, b := range []string{m.bucket, m.maskedBucket, m.nativeBucket} {
+		if err := m.deletePrefix(ctx, b, sessionID); err != nil {
+			return err
+		}
 	}
-	return m.deletePrefix(ctx, m.maskedBucket, sessionID)
+	return nil
 }
 
 func (m *MinIO) deletePrefix(ctx context.Context, bucket, sessionID string) error {

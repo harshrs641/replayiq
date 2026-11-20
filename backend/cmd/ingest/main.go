@@ -44,6 +44,7 @@ func main() {
 
 	// Ensure Kafka topics exist (idempotent).
 	if err := kafka.EnsureTopics(kafkaBrokers,
+		kafka.TopicEventsNative,
 		kafka.TopicEventsRaw,
 		kafka.TopicEventsMasked,
 		kafka.TopicAnalyzeRequested,
@@ -59,8 +60,23 @@ func main() {
 		extraMaskClasses = strings.Split(mc, ",")
 	}
 
+	// Asset uploads (Native DOM images and fonts) are stored directly.
+	bucket := getEnv("MINIO_BUCKET", "sessions")
+	minioStore, err := storage.NewMinIO(
+		getEnv("MINIO_ENDPOINT", "localhost:9000"),
+		getEnv("MINIO_ACCESS_KEY", "minioadmin"),
+		getEnv("MINIO_SECRET_KEY", "minioadmin"),
+		bucket, getEnv("MINIO_MASKED_BUCKET", bucket+"-masked"),
+		getEnv("MINIO_SECURE", "false") == "true",
+	)
+	if err != nil {
+		slog.Error("minio connect failed", "error", err)
+		os.Exit(1)
+	}
+
 	handler := api.NewIngestRouter(api.RouterConfig{
 		DB:          db,
+		MinIO:       minioStore,
 		Producer:    producer,
 		Masking:     masking.DefaultConfig(extraMaskClasses),
 		MaskTracker: masking.NewTracker(),

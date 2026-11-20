@@ -1,0 +1,27 @@
+name: replayiq_flutter_example
+description: Checkout demo recorded with replayiq_flutter.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.8.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  replayiq_flutter:
+    path: ../
+  http: ^1.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  # The plugin lives in a folder named `flutter`, not `replayiq_flutter`, and
+  # Swift Package Manager requires a path dependency's folder to match the
+  # package name. CocoaPods has no such rule.
+  config:
+    enable-swift-package-manager: false

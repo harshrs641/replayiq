@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/harshrs641/replayiq/internal/ingest"
 	"log/slog"
 	"net/http"
 	"os"
@@ -65,6 +66,7 @@ func main() {
 	analyzer := pipeline.NewAnalyzer(db, minio, aiEngine, cfg.AnalysisConcurrency)
 
 	// ─── HTTP Server ─────────────────────────────────────────────────────────
+	tracker := masking.NewTracker()
 	router := api.NewRouter(api.RouterConfig{
 		DB:       db,
 		MinIO:    minio,
@@ -78,7 +80,9 @@ func main() {
 			ProjectKey: cfg.JiraProjectKey,
 		},
 		Masking:     masking.DefaultConfig(extraMaskClasses),
-		MaskTracker: masking.NewTracker(),
+		MaskTracker: tracker,
+		Ingest: &ingest.Processor{MinIO: minio, Masking: masking.DefaultConfig(extraMaskClasses), Tracker: tracker,
+			PublicAPIURL: getEnv("PUBLIC_API_URL", "http://localhost:"+cfg.Port)},
 	})
 
 	srv := &http.Server{
@@ -141,26 +145,26 @@ func loadConfig() Config {
 	bucket := getEnv("MINIO_BUCKET", "sessions")
 	databaseURL := getEnv("DATABASE_URL", "postgres://replayiq:replayiq@localhost:5432/replayiq?sslmode=disable")
 	return Config{
-		Port:              getEnv("PORT", "8080"),
-		DatabaseURL:       databaseURL,
-		DatabaseReadURL:   getEnv("DATABASE_READ_URL", databaseURL),
-		MinIOEndpoint:     getEnv("MINIO_ENDPOINT", "localhost:9000"),
-		MinIOAccessKey:    getEnv("MINIO_ACCESS_KEY", "minioadmin"),
-		MinIOSecretKey:    getEnv("MINIO_SECRET_KEY", "minioadmin"),
-		MinIOBucket:       bucket,
-		MinIOMaskedBucket: getEnv("MINIO_MASKED_BUCKET", bucket+"-masked"),
-		MinIOSecure:       getEnv("MINIO_SECURE", "false") == "true",
-		OllamaEndpoint:    getEnv("OLLAMA_ENDPOINT", "http://localhost:11434"),
-		OllamaModel:       getEnv("OLLAMA_MODEL", "llama3.1:8b"),
-		OllamaSmallModel:  getEnv("OLLAMA_SMALL_MODEL", ""),
-		OllamaLargeModel:  getEnv("OLLAMA_LARGE_MODEL", ""),
-		EmbeddingModel:    getEnv("EMBEDDING_MODEL", "nomic-embed-text"),
-		JiraBaseURL:       getEnv("JIRA_BASE_URL", ""),
-		JiraEmail:         getEnv("JIRA_EMAIL", ""),
-		JiraAPIToken:      getEnv("JIRA_API_TOKEN", ""),
-		JiraProjectKey:    getEnv("JIRA_PROJECT_KEY", "ENG"),
-		SDKPath:             getEnv("SDK_PATH", "./sdk"),
-		MaskClasses:         getEnv("MASK_CLASSES", ""),
+		Port:                 getEnv("PORT", "8080"),
+		DatabaseURL:          databaseURL,
+		DatabaseReadURL:      getEnv("DATABASE_READ_URL", databaseURL),
+		MinIOEndpoint:        getEnv("MINIO_ENDPOINT", "localhost:9000"),
+		MinIOAccessKey:       getEnv("MINIO_ACCESS_KEY", "minioadmin"),
+		MinIOSecretKey:       getEnv("MINIO_SECRET_KEY", "minioadmin"),
+		MinIOBucket:          bucket,
+		MinIOMaskedBucket:    getEnv("MINIO_MASKED_BUCKET", bucket+"-masked"),
+		MinIOSecure:          getEnv("MINIO_SECURE", "false") == "true",
+		OllamaEndpoint:       getEnv("OLLAMA_ENDPOINT", "http://localhost:11434"),
+		OllamaModel:          getEnv("OLLAMA_MODEL", "llama3.1:8b"),
+		OllamaSmallModel:     getEnv("OLLAMA_SMALL_MODEL", ""),
+		OllamaLargeModel:     getEnv("OLLAMA_LARGE_MODEL", ""),
+		EmbeddingModel:       getEnv("EMBEDDING_MODEL", "nomic-embed-text"),
+		JiraBaseURL:          getEnv("JIRA_BASE_URL", ""),
+		JiraEmail:            getEnv("JIRA_EMAIL", ""),
+		JiraAPIToken:         getEnv("JIRA_API_TOKEN", ""),
+		JiraProjectKey:       getEnv("JIRA_PROJECT_KEY", "ENG"),
+		SDKPath:              getEnv("SDK_PATH", "./sdk"),
+		MaskClasses:          getEnv("MASK_CLASSES", ""),
 		AnalysisConcurrency:  getEnvInt("ANALYSIS_CONCURRENCY", 0),
 		SessionRetentionDays: getEnvInt("SESSION_RETENTION_DAYS", 0),
 	}

@@ -247,6 +247,8 @@ function buildMarkers(activityEvents, sessionStart) {
     .forEach(n => add(n, "network", `${n.method} ${shortUrl(n.url || "")} → ${n.status || "failed"}`));
   a.behaviour.filter(b => b.kind === "rage_click")
     .forEach(b => add(b, "rage", `Rage click: ${b.detail || ""}`));
+  a.behaviour.filter(b => b.strong && b.kind !== "rage_click")
+    .forEach(b => add(b, "error", `${b.label}: ${b.detail || ""}`));
   return out.sort((x, y) => x.ts - y.ts).slice(0, MAX_MARKERS);
 }
 
@@ -429,6 +431,15 @@ class ReplayStreamer {
     if (offset || play) player.goto(offset, play);
   }
 
+  // The page can lay out after the player is created (a deep link opens the
+  // detail before its column has a width): follow the real width.
+  resize(width) {
+    if (!width || width === this.width) return;
+    this.width = width;
+    this.player?.$set?.({ width });
+    this.player?.triggerResize?.();
+  }
+
   rangeAt(t) {
     return this.ranges.find(([a, b]) => a <= t && t < b) || null;
   }
@@ -550,8 +561,11 @@ class ReplayStreamer {
 
   seekAbs(t, play = this.playing) {
     if (!this.manifest) return;
+    // rrweb applies events strictly before the seek time, so seeking to the
+    // very end would leave out the session's last change.
+    const pastEnd = t >= this.manifest.end ? 1 : 0;
     t = Math.max(this.manifest.start, Math.min(t, this.manifest.end));
-    if (this.rangeAt(t)) this.player.goto(t - this.zero, play);
+    if (this.rangeAt(t)) this.player.goto(t - this.zero + pastEnd, play);
     else if (!this.loading) this.jumpTo(t, play);
   }
 
@@ -593,6 +607,8 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest, onActivity
     streamer.listeners.add(t => onTime?.(t));
     streamer.onActivity = a => { if (!cancelled) onActivity?.(a); }; // live refreshes
     streamerRef.current = streamer;
+    const resizeObserver = new ResizeObserver(() => streamer.resize(wrapperRef.current?.clientWidth));
+    resizeObserver.observe(wrapperRef.current);
 
     streamer.start().then(r => {
       if (cancelled) return;
@@ -618,6 +634,7 @@ function SessionReplay({ sessionId, playerApiRef, onTime, onManifest, onActivity
 
     return () => {
       cancelled = true;
+      resizeObserver.disconnect();
       streamer.destroy();
       if (playerApiRef) playerApiRef.current = null;
       if (containerRef.current) containerRef.current.innerHTML = "";
@@ -839,19 +856,77 @@ function buildActivity(events, sessionStart) {
       case "network":
         network.push({ ts, at, method: e.method || "GET", url: e.url, status: e.status, duration: e.duration, error: e.error });
         break;
+      default: {
+        // Mobile signals (Recording API v1.1).
+        const row = signalRow(e);
+        if (row) behaviour.push({ ts, at, ...row });
+      }
     }
   }
-  // Inputs fire per keystroke; collapse a run on the same field into one row.
+  // Inputs fire per keystroke and scrolls per gesture; collapse a run on
+  // the same field or list into one row.
   const merged = [];
   for (const b of behaviour) {
     const prev = merged[merged.length - 1];
-    if (b.kind === "input" && prev?.kind === "input" && prev.detail === b.detail) {
+    if ((b.kind === "input" || b.kind === "scroll") && prev?.kind === b.kind && prev.detail === b.detail) {
       prev.count = (prev.count || 1) + 1;
       continue;
     }
     merged.push({ ...b });
   }
   return { behaviour: merged, console: consoleLogs, network };
+}
+
+const GESTURES = { double_tap: "Double tap", long_press: "Long press", swipe: "Swipe", pinch: "Pinch", pan: "Pan" };
+
+// A Behaviour row for a mobile signal, or null to leave it out. `strong`
+// rows are problems: listed under "Frustration only" and marked on the
+// timeline.
+function signalRow(e) {
+  const ms = v => (v == null ? "" : `${Math.round(v)} ms`);
+  switch (e.subtype) {
+    case "gesture":
+      // Taps already appear as clicks.
+      return GESTURES[e.kind] ? { kind: "gesture", label: GESTURES[e.kind], detail: e.selector || "" } : null;
+    case "focus":
+      return { kind: "focus", label: "Focus", detail: e.selector };
+    case "scroll":
+      return { kind: "scroll", label: "Scroll", detail: e.selector || "screen" };
+    case "lifecycle":
+      return { kind: "lifecycle", label: { background: "App backgrounded", foreground: "App foregrounded", terminate: "App closed" }[e.state] || "Lifecycle", detail: e.cold ? "cold start" : "" };
+    case "app_start":
+      return { kind: "app_start", label: "App start", detail: `${e.kind || ""} · ${ms(e.duration)}`, strong: e.duration > 4000 };
+    case "screen_load":
+      return { kind: "screen_load", label: "Screen load", detail: `${e.screen || ""} · ${ms(e.duration)}`, strong: e.duration > 3000 };
+    case "jank":
+      return {
+        kind: "jank", label: e.frozen ? "Frozen frames" : "Jank",
+        detail: `${e.dropped || 0} dropped, ${e.frozen || 0} frozen, worst ${ms(e.worst)}${e.screen ? ` · ${e.screen}` : ""}`,
+        strong: e.frozen > 0,
+      };
+    case "hang":
+      return { kind: "hang", label: "App hang", detail: ms(e.duration), strong: true };
+    case "memory":
+      return { kind: "memory", label: "Memory warning", detail: `${e.level || ""}${e.used ? ` · ${e.used} MB` : ""}`, strong: e.level === "critical" };
+    case "keyboard":
+      return { kind: "keyboard", label: e.visible ? "Keyboard shown" : "Keyboard hidden", detail: "" };
+    case "orientation":
+      return { kind: "orientation", label: "Rotated", detail: e.value };
+    case "connectivity":
+      return { kind: "connectivity", label: "Network", detail: [e.network, e.quality].filter(Boolean).join(" · "), strong: e.network === "none" };
+    case "deeplink":
+      return { kind: "deeplink", label: "Deep link", detail: e.url };
+    case "push_open":
+      return { kind: "push_open", label: "Opened from push", detail: e.campaign || "" };
+    case "permission":
+      return { kind: "permission", label: "Permission", detail: `${e.name || ""}: ${e.result || ""}` };
+    case "thermal":
+      return { kind: "thermal", label: "Thermal state", detail: e.state, strong: e.state === "critical" || e.state === "serious" };
+    case "power":
+      return { kind: "power", label: e.low_power ? "Low power mode on" : "Low power mode off", detail: "" };
+    default:
+      return null;
+  }
 }
 
 const ACTIVITY_TABS = [
@@ -866,7 +941,7 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
   const activity = useMemo(() => buildActivity(events || [], start), [events, start]);
 
   const errorCount = {
-    behaviour: activity.behaviour.filter(b => b.kind === "rage_click").length,
+    behaviour: activity.behaviour.filter(b => b.kind === "rage_click" || b.strong).length,
     console: activity.console.filter(c => c.level === "error" || c.level === "exception").length,
     network: activity.network.filter(n => !n.status || n.status >= 400).length,
   };
@@ -874,7 +949,7 @@ function ActivityPanel({ events, start, currentTime, onSeek }) {
   let rows = activity[tab];
   if (errorsOnly) {
     rows = rows.filter(r =>
-      tab === "behaviour" ? r.kind === "rage_click"
+      tab === "behaviour" ? (r.kind === "rage_click" || r.strong)
       : tab === "console" ? r.level === "error" || r.level === "exception"
       : !r.status || r.status >= 400);
   }

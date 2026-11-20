@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ─── Session ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +56,16 @@ type EventBatch struct {
 	// masking only redacts DOM text and attributes, so no masked copy is
 	// stored and replays serve this copy as the masked view.
 	DeviceMasked bool `json:"device_masked,omitempty"`
+	// BatchID identifies the batch across retries (recording API v1): the
+	// batch is stored under it, so a retry replaces it instead of adding
+	// its events twice.
+	BatchID string `json:"batch_id,omitempty"`
+	// Platform: web, flutter, ios, android or react-native.
+	Platform string `json:"platform,omitempty"`
+	SDK      string `json:"sdk,omitempty"`
+	// Dropped counts events skipped while decoding because they didn't
+	// fit the schema (see EventBatch.UnmarshalJSON).
+	Dropped int `json:"-"`
 }
 
 type RRWebEvent struct {
@@ -74,6 +87,17 @@ type RRWebEvent struct {
 	Colno    int    `json:"colno,omitempty"`
 	Stack    string `json:"stack,omitempty"`
 	Error    string `json:"error,omitempty"`
+	// Mobile recording (subtype "screen" / "touch", recording API v1):
+	// converted to rrweb events on ingest, see api/mobile_frames.go.
+	Width    float64 `json:"width,omitempty"`
+	Height   float64 `json:"height,omitempty"`
+	Image    string  `json:"image,omitempty"`
+	Keyframe bool    `json:"keyframe,omitempty"`
+	X        float64 `json:"x,omitempty"`
+	Y        float64 `json:"y,omitempty"`
+	Phase    string  `json:"phase,omitempty"`
+	// Extra holds a Custom event's other fields (see event_extra.go).
+	Extra map[string]json.RawMessage `json:"-"`
 }
 
 type CustomEvent struct {

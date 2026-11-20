@@ -5,6 +5,7 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,11 +16,18 @@ import (
 	kafkago "github.com/segmentio/kafka-go"
 )
 
+// MaxMessageBytes is the largest Kafka message ReplayIQ topics accept (one
+// oversized event; batches are split well below it).
+const MaxMessageBytes = 8 << 20
+
 // Topic names shared by all services.
 const (
-	TopicEventsRaw          = "events.raw"
-	TopicEventsMasked       = "events.masked"
-	TopicAnalyzeRequested   = "session.analyze-requested"
+	// TopicEventsNative: batches as SDKs sent them, before conversion to
+	// rrweb and masking (see package ingest).
+	TopicEventsNative     = "events.native"
+	TopicEventsRaw        = "events.raw"
+	TopicEventsMasked     = "events.masked"
+	TopicAnalyzeRequested = "session.analyze-requested"
 )
 
 // AnalyzeRequestedEvent is the payload published when a session is ready for
@@ -66,6 +74,9 @@ func (p *Producer) writer(topic string) *kafkago.Writer {
 		// Event batches (especially mobile screenshot frames) compress ~7x;
 		// consumers decompress transparently.
 		Compression: kafkago.Zstd,
+		// Producers split batches to ~800 KB (ingest.PublishBatch); this
+		// admits a single event that is larger on its own.
+		BatchBytes: MaxMessageBytes,
 	}
 	p.writers[topic] = w
 	return w
@@ -102,7 +113,7 @@ type Message struct {
 // Offsets are committed after the handler succeeds; on failure the offset is
 // NOT committed so the message is redelivered on the next restart.
 type Consumer struct {
-	reader  *kafkago.Reader
+	reader *kafkago.Reader
 }
 
 func NewConsumer(brokers []string, groupID, topic string) *Consumer {
@@ -178,7 +189,29 @@ func EnsureTopics(brokers []string, topics ...string) error {
 			Topic:             t,
 			NumPartitions:     12,
 			ReplicationFactor: 1,
+			ConfigEntries:     []kafkago.ConfigEntry{{ConfigName: "max.message.bytes", ConfigValue: strconv.Itoa(MaxMessageBytes)}},
 		}
 	}
-	return ctrlConn.CreateTopics(topicConfigs...)
+	if err := ctrlConn.CreateTopics(topicConfigs...); err != nil && !errors.Is(err, kafkago.TopicAlreadyExists) {
+		return err
+	}
+	// Topics created before the limit was raised keep 1 MB: raise it.
+	client := &kafkago.Client{Addr: kafkago.TCP(brokers...), Timeout: 10 * time.Second}
+	var resources []kafkago.AlterConfigRequestResource
+	for _, t := range topics {
+		resources = append(resources, kafkago.AlterConfigRequestResource{
+			ResourceType: kafkago.ResourceTypeTopic, ResourceName: t,
+			Configs: []kafkago.AlterConfigRequestConfig{{Name: "max.message.bytes", Value: strconv.Itoa(MaxMessageBytes)}},
+		})
+	}
+	res, err := client.AlterConfigs(context.Background(), &kafkago.AlterConfigsRequest{Resources: resources})
+	if err != nil {
+		return fmt.Errorf("raise max.message.bytes: %w", err)
+	}
+	for r, rerr := range res.Errors {
+		if rerr != nil {
+			return fmt.Errorf("raise max.message.bytes on %s: %w", r.Name, rerr)
+		}
+	}
+	return nil
 }

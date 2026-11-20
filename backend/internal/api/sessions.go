@@ -32,10 +32,18 @@ func (r *router) handleSessions(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *router) createSession(w http.ResponseWriter, req *http.Request) {
+	body, err := readIngestBody(w, req, 64<<10)
+	if err != nil {
+		writeBodyError(w, err)
+		return
+	}
 	var s models.Session
-	if err := json.NewDecoder(req.Body).Decode(&s); err != nil {
+	if err := json.Unmarshal(body, &s); err != nil || s.ID == "" {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
+	}
+	if s.ProjectID == "" {
+		s.ProjectID = ingestKey(req)
 	}
 	s.StoragePath = fmt.Sprintf("sessions/%s", s.ID)
 	if err := r.cfg.DB.CreateSession(req.Context(), &s); err != nil {
@@ -109,7 +117,9 @@ func (r *router) endSession(w http.ResponseWriter, req *http.Request, sessionID 
 		EndedAt    string `json:"ended_at"`
 		DurationMs int64  `json:"duration_ms"`
 	}
-	json.NewDecoder(req.Body).Decode(&body)
+	if raw, err := readIngestBody(w, req, 16<<10); err == nil {
+		json.Unmarshal(raw, &body)
+	}
 	t, _ := time.Parse(time.RFC3339, body.EndedAt)
 	r.cfg.DB.EndSession(req.Context(), sessionID, t, body.DurationMs)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

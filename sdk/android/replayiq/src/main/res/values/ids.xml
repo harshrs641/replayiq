@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- View tag key set by ReplayIQ.mask(view) / ReplayIQ.unmask(view). -->
+    <item name="replayiq_mask" type="id" />
+    <!-- Native DOM node ids of a view (internal). -->
+    <item name="replayiq_node" type="id" />
+</resources>

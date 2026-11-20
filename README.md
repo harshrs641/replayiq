@@ -154,8 +154,8 @@ Paste this in any browser console to start recording immediately:
 <script>
   ReplayIQ.init({
     endpoint: 'https://your-replayiq-host',
-    projectId: 'your-project-id',
-    sampleRate: 1.0,      // 0.0–1.0, default 1.0; decided once per session
+    key: 'your-ingest-key',     // for now: the project id
+    sampleRate: 1.0,            // 0.0–1.0, default 1.0; decided once per session
     pauseWhenHiddenMs: 60000,   // pause recording in a tab hidden this long (0 = never)
     pauseWhenIdleMs: 600000,    // pause after this long with no input (0 = never)
     debug: false,
@@ -163,34 +163,43 @@ Paste this in any browser console to start recording immediately:
 </script>
 ```
 
+The script loads `rrweb.min.js` from the same folder, so the page's Content Security Policy only needs to allow your ReplayIQ host.
+
+### Option C — npm
+
+```bash
+npm install @replayiq/web
+```
+
+```javascript
+import ReplayIQ from '@replayiq/web';
+ReplayIQ.init({ endpoint: 'https://your-replayiq-host', key: 'your-ingest-key' });
+```
+
+The package (source in [`sdk/web`](sdk/web)) also ships the script-tag build for CDNs (`https://cdn.jsdelivr.net/npm/@replayiq/web@1/dist/replayiq.min.js`). `npm run build` there regenerates `sdk/replayiq.js`, which this server serves.
+
 The SDK keeps its own cost on the page low:
 - **Sampling is decided once per session,** before anything is downloaded. A session that isn't sampled never loads rrweb and sends nothing, and a sampled one is recorded on every page it visits.
 - **rrweb loads after the page has loaded and the browser is idle.** Network, console and error capture start right away, so nothing from page startup is missed.
 - **Recording pauses** when a tab has been hidden for a minute or nobody has interacted for 10 minutes. It resumes with a fresh snapshot when the user comes back.
-- **Batches are sent whenever the tab is hidden,** because mobile browsers often close tabs without `beforeunload`.
+- **Sending is reliable and small.** Batches are gzipped and retried with backoff under the same `batch_id`, so the server stores each batch once. They are also sent whenever the tab is hidden, because mobile browsers often close tabs without unloading the page.
+- **Consent:** `ReplayIQ.optOut()` and `ReplayIQ.optIn()`.
 
-### Option C — NPM module (coming soon)
+### Flutter
 
-```bash
-npm install @replayiq/sdk
+[`sdk/flutter`](sdk/flutter) (`replayiq_flutter`): `ReplayIQ.init(key:, endpoint:)` plus `ReplayIQ.navigatorObserver` records masked screenshots, touches, taps, navigation, console, errors and HTTP calls from iOS and Android Flutter apps. See its README for setup and masking.
+
+### How recordings reach storage
+
+```
+SDK ─▶ gateway ─▶ ingest API ─▶ Kafka events.native ─▶ transformer (processor) ─▶ events.raw / events.masked ─▶ storage
 ```
 
-```javascript
-import ReplayIQ from '@replayiq/sdk';
+The ingest API only checks and accepts a batch (or answers 503 so the SDK retries). The transformer worker keeps mobile batches as sent (`sessions-native` bucket), converts screenshots and Native DOM recordings to rrweb (`internal/transform`), masks, and hands the result to the storage workers. Images and fonts that Native DOM recordings reference live in the `sessions-assets` bucket. Set `PUBLIC_API_URL` on the processor to the address dashboards use to reach the API. The all-in-one server does the same inline.
 
-ReplayIQ.init({
-  endpoint: 'https://your-replayiq-host',
-  projectId: 'your-project-id',
-});
+### Building an SDK for another platform
 
-// Identify users
-ReplayIQ.identify('user-123', { plan: 'enterprise', email: 'user@co.com' });
-
-// Track custom events
-ReplayIQ.track('checkout_started', { cart_value: 99.99 });
-```
-
----
+Every SDK (web, Flutter, iOS, Android, React Native) talks to the same [Recording API v1](docs/sdk/recording-api-v1.md). It covers authentication, gzip, batching, retries, mobile screenshots and touches, and the shared app-event types. [Recording API v1.1](docs/sdk/recording-api-v1.1-native-dom.md) adds Native DOM recording for mobile, where the UI is sent as a tree of nodes and changes instead of screenshots, plus mobile-only signals.
 
 ## AI Session Analysis
 

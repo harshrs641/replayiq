@@ -1,0 +1,15 @@
+replayiq_flutter
+Copyright 2026 ReplayIQ
+
+This product includes software derived from mixpanel_flutter_session_replay
+2.1.0 (https://github.com/mixpanel/mixpanel-flutter/tree/main/packages/mixpanel_flutter_session_replay),
+Copyright 2022 Mixpanel, Inc., licensed under the Apache License, Version 2.0
+(see LICENSE).
+
+Derived files carry a "Derived from mixpanel_flutter_session_replay" header
+that says what was changed. In summary: the screenshot capture, on-device
+masking (text fields, images, text, the mask/unmask widgets), touch sampling,
+capture scheduling and the native JPEG encoders were forked; Mixpanel's
+upload, remote settings, event triggers, analytics registration, wireframes,
+web support and SQLite queue were removed and replaced by ReplayIQ's own
+Recording API v1 transport.
