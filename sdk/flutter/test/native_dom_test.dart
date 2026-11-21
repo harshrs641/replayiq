@@ -142,6 +142,15 @@ void main() {
       final r = walk(tester);
       final inputs = all(r.root).where((n) => n.k == 'input').toList();
       expect(inputs.map((n) => n.input!['type']), ['text', 'password']);
+      // Length (drawn as dots) but never a password's; its text style and insets.
+      expect(inputs.map((n) => n.input!['len']), [8, null]);
+      expect(inputs.last.input!['filled'], isTrue);
+      for (final i in inputs) {
+        final tx = i.input!['tx'] as Map;
+        expect(tx['size'], greaterThan(0));
+        expect(tx['col'], isA<String>());
+        expect(i.input!['pad'], [0.0, 0.0]);
+      }
       final json = r.root.toJson().toString();
       expect(json, isNot(contains('Jane')));
       expect(json, isNot(contains('4242')));

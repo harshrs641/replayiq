@@ -498,8 +498,17 @@ internal class ViewWalker(
                 variation == InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS) -> "email"
             else -> "text"
         }
-        // Never the value: only its length (drawn as dots) and the hint.
-        n.input = DomNode.InputInfo(type, et.hint?.toString()?.takeIf { it.isNotBlank() }?.let { ViewInspector.clean(it) }, et.text?.length ?: 0, et.isFocused)
+        // Never the value: only its length (drawn as dots) and the hint. Passwords: not even the
+        // length, only that they have content. Plus the field's text style, hint colour and text
+        // insets, so the replay draws it like the app.
+        val password = type == "password"
+        val length = et.text?.length ?: 0
+        n.input = DomNode.InputInfo(type, et.hint?.toString()?.takeIf { it.isNotBlank() }?.let { ViewInspector.clean(it) },
+            if (password) 0 else length, et.isFocused,
+            style = textInfo(et, "", et.currentTextColor, ids),
+            pc = et.currentHintTextColor,
+            filled = password && length > 0,
+            pad = Pair(et.compoundPaddingLeft / d, et.compoundPaddingRight / d))
         return n
     }
 

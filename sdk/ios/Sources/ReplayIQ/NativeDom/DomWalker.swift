@@ -623,15 +623,35 @@ final class DomWalker {
 
     static func input(_ view: UIView) -> DomInput? {
         if let tf = view as? UITextField {
-            return DomInput(type: tf.isSecureTextEntry ? "password" : keyboardType(tf.keyboardType),
-                            placeholder: tf.placeholder ?? tf.attributedPlaceholder?.string,
-                            length: tf.isSecureTextEntry ? nil : (tf.text?.count).flatMap { $0 > 0 ? $0 : nil },
-                            focus: tf.isFirstResponder)
+            let empty = tf.text?.isEmpty ?? true
+            var i = DomInput(type: tf.isSecureTextEntry ? "password" : keyboardType(tf.keyboardType),
+                             placeholder: tf.placeholder ?? tf.attributedPlaceholder?.string,
+                             length: tf.isSecureTextEntry ? nil : (tf.text?.count).flatMap { $0 > 0 ? $0 : nil },
+                             focus: tf.isFirstResponder)
+            i.filled = tf.isSecureTextEntry && !empty
+            i.style = text(value: "", font: tf.font ?? .systemFont(ofSize: 17),
+                           color: (tf.textColor ?? .label).resolvedColor(with: tf.traitCollection).cgColor,
+                           alignment: tf.textAlignment, rtl: tf.effectiveUserInterfaceLayoutDirection == .rightToLeft, lines: 1)
+            var ph = UIColor.placeholderText
+            if let a = tf.attributedPlaceholder, a.length > 0,
+               let c = a.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? UIColor { ph = c }
+            i.placeholderColor = DomColor.argb(ph.resolvedColor(with: tf.traitCollection).cgColor)
+            let r = tf.textRect(forBounds: tf.bounds)
+            i.pad = (max(0, r.minX), max(0, tf.bounds.width - r.maxX))
+            return i
         }
         if let tv = view as? UITextView, tv.isEditable {
-            return DomInput(type: tv.isSecureTextEntry ? "password" : "textarea", placeholder: nil,
-                            length: tv.isSecureTextEntry ? nil : (tv.text.isEmpty ? nil : tv.text.count),
-                            focus: tv.isFirstResponder)
+            var i = DomInput(type: tv.isSecureTextEntry ? "password" : "textarea", placeholder: nil,
+                             length: tv.isSecureTextEntry ? nil : (tv.text.isEmpty ? nil : tv.text.count),
+                             focus: tv.isFirstResponder)
+            i.filled = tv.isSecureTextEntry && !tv.text.isEmpty
+            var s = text(tv)
+            s.value = ""
+            i.style = s
+            let inset = tv.textContainerInset
+            let lp = tv.textContainer.lineFragmentPadding
+            i.pad = (inset.left + lp, inset.right + lp)
+            return i
         }
         return nil
     }

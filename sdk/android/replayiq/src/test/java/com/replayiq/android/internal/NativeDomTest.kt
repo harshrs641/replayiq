@@ -166,6 +166,31 @@ class NativeDomTest {
         assertEquals(2, countKind(tree, "mask"))
     }
 
+    @Test fun inputCarriesItsTextStyleHintColourAndInsets() {
+        val ctx: Application = ApplicationProvider.getApplicationContext()
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(EditText(ctx).apply {
+                hint = "Full name"; setText("Jane"); textSize = 18f
+                setTextColor(Color.WHITE); setHintTextColor(Color.GRAY); setPadding(24, 0, 12, 0)
+            })
+            addView(EditText(ctx).apply { inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD; setText("hunter2") })
+        }
+        layout(root)
+        val tree = walker().walk(root).root
+        val name = find(tree) { it.input?.ph == "Full name" }!!.ownJson().getJSONObject("in")
+        val tx = name.getJSONObject("tx")
+        assertEquals("#FFFFFFFF", tx.getString("col"))
+        assertTrue(tx.getDouble("size") > 0)
+        assertFalse(tx.has("v")) // never the value
+        assertEquals("#FF888888", name.getString("pc"))
+        assertEquals(2, name.getJSONArray("pad").length())
+        val pw = find(tree) { it.input?.type == "password" }!!.ownJson().getJSONObject("in")
+        assertTrue(pw.getBoolean("filled"))
+        assertFalse(pw.has("len")) // a password never sends its length
+        assertFalse(tree.fullJson().toString().contains("hunter2"))
+    }
+
     private fun countKind(n: DomNode, k: String): Int = (if (n.k == k) 1 else 0) + n.c.sumOf { countKind(it, k) }
 
     @Test fun scrollViewChildrenStayInContentCoordinates() {

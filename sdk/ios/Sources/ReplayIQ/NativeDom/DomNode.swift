@@ -120,12 +120,36 @@ struct DomInput: Equatable {
     var placeholder: String?
     var length: Int?
     var focus: Bool
+    /// How the field draws its text (its value is left empty).
+    var style: DomText? = nil
+    /// Placeholder colour.
+    var placeholderColor: UInt32? = nil
+    /// A secure field has content (its length is never sent).
+    var filled = false
+    /// Text insets within the frame: left, right.
+    var pad: (CGFloat, CGFloat)? = nil
+
+    static func == (a: DomInput, b: DomInput) -> Bool {
+        a.type == b.type && a.placeholder == b.placeholder && a.length == b.length && a.focus == b.focus
+            && a.style == b.style && a.placeholderColor == b.placeholderColor
+            && a.filled == b.filled && a.pad?.0 == b.pad?.0 && a.pad?.1 == b.pad?.1
+    }
 
     func json() -> [String: Any] {
         var i: [String: Any] = ["type": type]
         if let placeholder, !placeholder.isEmpty { i["ph"] = placeholder }
         if let length { i["len"] = length }
         if focus { i["focus"] = true }
+        if let style {
+            var t = style.json()
+            t.removeValue(forKey: "v")
+            t.removeValue(forKey: "lh")
+            t.removeValue(forKey: "ml")
+            i["tx"] = t
+        }
+        if let placeholderColor { i["pc"] = DomColor.hex(placeholderColor) }
+        if filled { i["filled"] = true }
+        if let pad { i["pad"] = [DomColor.round(pad.0), DomColor.round(pad.1)] }
         return i
     }
 }

@@ -146,6 +146,17 @@ class UiWalker {
         ..input = {
           'type': ro.obscureText ? 'password' : 'text',
           'focus': ro.hasFocus,
+          // One dot per character in the replay; passwords never send
+          // their length, only that they have content.
+          if (!ro.obscureText && ro.plainText.isNotEmpty)
+            'len': ro.plainText.length,
+          if (ro.obscureText && ro.plainText.isNotEmpty) 'filled': true,
+          // The editable's box is exactly its text: no inset.
+          'tx': {
+            ..._style(ro.text?.style, ro.textScaler),
+            'al': _align(ro.textAlign, ro.textDirection),
+          },
+          'pad': const [0.0, 0.0],
         };
       return; // the value is never read
     }
@@ -487,21 +498,7 @@ class UiWalker {
 
     collect(ro.text, null);
     final scaler = ro.textScaler;
-    Map<String, Object?> styleOf(TextStyle? s) {
-      if (s == null) return const {};
-      final size = s.fontSize == null ? null : scaler.scale(s.fontSize!);
-      if (s.fontFamily != null) _families.add(s.fontFamily!);
-      return {
-        'font': ?s.fontFamily,
-        'size': ?(size == null ? null : r1(size)),
-        'w': ?s.fontWeight?.value,
-        if (s.fontStyle == FontStyle.italic) 'i': true,
-        'col': ?_color(s.color ?? s.foreground?.color),
-        'lh': ?((size != null && s.height != null)
-            ? r1(size * s.height!)
-            : null),
-      };
-    }
+    Map<String, Object?> styleOf(TextStyle? s) => _style(s, scaler);
 
     final first = leaves.isEmpty ? null : leaves.first.$2;
     return {
@@ -514,6 +511,20 @@ class UiWalker {
       ...styleOf(first),
       'al': _align(ro.textAlign, ro.textDirection),
       'ml': ?ro.maxLines,
+    };
+  }
+
+  Map<String, Object?> _style(TextStyle? s, TextScaler scaler) {
+    if (s == null) return const {};
+    final size = s.fontSize == null ? null : scaler.scale(s.fontSize!);
+    if (s.fontFamily != null) _families.add(s.fontFamily!);
+    return {
+      'font': ?s.fontFamily,
+      'size': ?(size == null ? null : r1(size)),
+      'w': ?s.fontWeight?.value,
+      if (s.fontStyle == FontStyle.italic) 'i': true,
+      'col': ?_color(s.color ?? s.foreground?.color),
+      'lh': ?((size != null && s.height != null) ? r1(size * s.height!) : null),
     };
   }
 

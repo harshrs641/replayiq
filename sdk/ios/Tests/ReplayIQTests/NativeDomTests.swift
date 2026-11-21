@@ -151,6 +151,14 @@ final class DomWalkerTests: XCTestCase {
         XCTAssertEqual(inputs[0].input?.length, 16)
         XCTAssertEqual(inputs[1].input?.type, "password")
         XCTAssertNil(inputs[1].input?.length)
+        // The field's text style, placeholder colour and insets, so the replay draws it like the app;
+        // a filled password says only that it has content.
+        XCTAssertNotNil(inputs[0].input?.style)
+        XCTAssertEqual(inputs[0].input?.style?.value, "", "the style never carries the value")
+        XCTAssertNotNil(inputs[0].input?.placeholderColor)
+        XCTAssertNotNil(inputs[0].input?.pad)
+        XCTAssertTrue(inputs[1].input?.filled == true)
+        XCTAssertNil(inputs[1].input?.json()["len"])
         XCTAssertTrue(inputs.allSatisfy { $0.children.isEmpty }, "an input's subviews (its value) are never walked")
         // The value is nowhere in the tree.
         let json = DomTree(root) { own($0) }.root.description

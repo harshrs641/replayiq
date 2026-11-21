@@ -52,7 +52,17 @@ internal class DomNode(val id: Int, var k: String) {
         val align: String?, val lineHeight: Float, val maxLines: Int, val font: String? = null,
     )
 
-    data class InputInfo(val type: String, val ph: String?, val len: Int, val focus: Boolean)
+    data class InputInfo(
+        val type: String, val ph: String?, val len: Int, val focus: Boolean,
+        /** How the field draws its text (its `v` is never serialised here). */
+        val style: TextInfo? = null,
+        /** Hint colour. */
+        val pc: Int? = null,
+        /** A password field has content (its length is never sent). */
+        val filled: Boolean = false,
+        /** Text insets within the frame (dp): left, right. Null when unknown. */
+        val pad: Pair<Float, Float>? = null,
+    )
 
     /** The node's own fields: everything but `c`. */
     fun ownJson(): JSONObject {
@@ -96,6 +106,17 @@ internal class DomNode(val id: Int, var k: String) {
             i.ph?.let { j.put("ph", it) }
             if (i.len > 0) j.put("len", i.len)
             if (i.focus) j.put("focus", true)
+            i.style?.let { t ->
+                val tj = JSONObject().put("size", r1(t.size)).put("col", color(t.color))
+                if (t.weight != 400) tj.put("w", t.weight)
+                if (t.italic) tj.put("i", true)
+                t.align?.let { tj.put("al", it) }
+                t.font?.let { tj.put("font", it) }
+                j.put("tx", tj)
+            }
+            i.pc?.let { j.put("pc", color(it)) }
+            if (i.filled) j.put("filled", true)
+            i.pad?.let { j.put("pad", JSONArray().put(r1(it.first)).put(r1(it.second))) }
             o.put("in", j)
         }
         so?.let { o.put("so", JSONArray().put(r1(it[0])).put(r1(it[1]))) }

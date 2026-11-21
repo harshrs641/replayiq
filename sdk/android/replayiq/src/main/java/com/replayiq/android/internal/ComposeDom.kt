@@ -116,8 +116,13 @@ internal object ComposeDom {
             n.k = "input"
             val password = cfg.contains(SemanticsProperties.Password)
             val ph = firstText(sn, editable.text)
-            n.input = DomNode.InputInfo(if (password) "password" else "text", ph?.let { ViewInspector.clean(it) }, editable.text.length,
-                cfg.getOrNull(SemanticsProperties.Focused) == true)
+            // Passwords send only that they have content. The text style comes from the field's
+            // layout; its inset inside the decoration box isn't exposed through semantics, so no
+            // `pad` (the replay uses a default inset).
+            n.input = DomNode.InputInfo(if (password) "password" else "text", ph?.let { ViewInspector.clean(it) },
+                if (password) 0 else editable.text.length, cfg.getOrNull(SemanticsProperties.Focused) == true,
+                style = if (hasTextLayout(cfg)) textInfo(cfg, "", ctx) else null,
+                filled = password && editable.text.isNotEmpty())
             n.role = "input"
             return n
         }
@@ -192,6 +197,11 @@ internal object ComposeDom {
             firstText(c, value, depth + 1)?.let { return it }
         }
         return null
+    }
+
+    private fun hasTextLayout(cfg: androidx.compose.ui.semantics.SemanticsConfiguration): Boolean {
+        val results = ArrayList<TextLayoutResult>(1)
+        return try { cfg.getOrNull(SemanticsActions.GetTextLayoutResult)?.action?.invoke(results) == true && results.isNotEmpty() } catch (_: Throwable) { false }
     }
 
     private fun textInfo(cfg: androidx.compose.ui.semantics.SemanticsConfiguration, text: String, ctx: Ctx): DomNode.TextInfo {
