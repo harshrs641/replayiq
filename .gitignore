@@ -21,8 +21,9 @@ dashboard/dist/
 .idea/
 .vscode/
 
-# Claude Code session files
-.claude/
+# Claude Code session files (skills are shared and committed)
+**/.claude/*
+!**/.claude/skills/
 sdk/web/node_modules/
 sdk/web/dist/
 sdk/react-native/android/build/
