@@ -1,0 +1,31 @@
+{
+  "name": "@replayiq/web",
+  "version": "1.2.0",
+  "description": "ReplayIQ session replay and error capture for websites",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "unpkg": "./dist/replayiq.min.js",
+  "jsdelivr": "./dist/replayiq.min.js",
+  "files": ["dist", "index.d.ts", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node build.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "rrweb": "1.1.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

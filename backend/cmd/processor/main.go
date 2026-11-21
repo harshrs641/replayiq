@@ -1,9 +1,9 @@
 // Command processor is the Kafka consumer service.  It runs three concurrent
 // workers:
 //
-//   storage-worker-raw    events.raw      → MinIO sessions bucket
-//   storage-worker-masked events.masked   → MinIO sessions-masked bucket
-//   ai-worker             session.analyze-requested → AI pipeline → Postgres
+//	storage-worker-raw    events.raw      → MinIO sessions bucket
+//	storage-worker-masked events.masked   → MinIO sessions-masked bucket
+//	ai-worker             session.analyze-requested → AI pipeline → Postgres
 //
 // There is no HTTP server; the processor is a pure background worker.
 package main
@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"github.com/harshrs641/replayiq/internal/ai"
+	"github.com/harshrs641/replayiq/internal/ingest"
 	"github.com/harshrs641/replayiq/internal/kafka"
+	"github.com/harshrs641/replayiq/internal/masking"
 	"github.com/harshrs641/replayiq/internal/models"
 	"github.com/harshrs641/replayiq/internal/pipeline"
 	"github.com/harshrs641/replayiq/internal/storage"
@@ -69,6 +71,36 @@ func main() {
 	defer cancel()
 
 	var wg sync.WaitGroup
+
+	// Transformer — events.native → convert mobile recordings to rrweb, keep
+	// the native copy, mask → events.raw / events.masked (package ingest).
+	producer := kafka.NewProducer(kafkaBrokers)
+	defer producer.Close()
+	var extraMaskClasses []string
+	if mc := getEnv("MASK_CLASSES", ""); mc != "" {
+		extraMaskClasses = strings.Split(mc, ",")
+	}
+	transformer := &ingest.Processor{
+		MinIO:        minio,
+		Masking:      masking.DefaultConfig(extraMaskClasses),
+		Tracker:      masking.NewTracker(),
+		Publisher:    producer,
+		PublicAPIURL: getEnv("PUBLIC_API_URL", "http://localhost:8080"),
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		slog.Info("transformer starting", "topic", kafka.TopicEventsNative)
+		c := kafka.NewConsumer(kafkaBrokers, "transformer", kafka.TopicEventsNative)
+		defer c.Close()
+		c.Run(ctx, func(msg kafka.Message) error {
+			var batch models.EventBatch
+			if err := json.Unmarshal(msg.Value, &batch); err != nil {
+				return err
+			}
+			return transformer.Process(ctx, batch)
+		})
+	}()
 
 	// Storage Worker — raw events → MinIO raw bucket
 	wg.Add(1)
@@ -131,6 +163,18 @@ func main() {
 			}
 			return analyzer.Analyze(ctx, evt.SessionID)
 		})
+	}()
+
+	// Retention — deletes expired sessions (stored events and rows) hourly.
+	retention, err := pipeline.ParseRetention(getEnvInt("SESSION_RETENTION_DAYS", 0), getEnv("SESSION_RETENTION_DAYS_BY_PROJECT", ""))
+	if err != nil {
+		slog.Error("invalid retention config", "error", err)
+		os.Exit(1)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pipeline.RunRetention(ctx, pipeline.StorageRetention{DB: db, MinIO: minio}, retention, time.Hour)
 	}()
 
 	slog.Info("processor ready — waiting for messages")

@@ -153,7 +153,7 @@ func (o *OllamaEngine) AnalyzeSession(ctx context.Context, session *models.Sessi
 		return nil, fmt.Errorf("ollama analyze: %w", err)
 	}
 
-	summary, err := parseAnalysisResponse(raw)
+	summary, refs, err := parseAnalysisResponse(raw)
 	if err != nil {
 		// Fallback: basic summary
 		summary = &models.SessionSummary{
@@ -162,13 +162,39 @@ func (o *OllamaEngine) AnalyzeSession(ctx context.Context, session *models.Sessi
 		}
 	}
 	summary.TokenizedEvents = tokenized
+	groundSummary(summary, refs, tokenized)
 	return summary, nil
+}
+
+// groundSummary sets when each frustration and issue happened, from the
+// model's event citations (indexes into the numbered prompt events) or,
+// failing that, by matching the text against the events.
+func groundSummary(summary *models.SessionSummary, frustrationRefs []int, tokenized []models.TokenizedEvent) {
+	cited := citedEvents(truncateEventsForPrompt(tokenized))
+	summary.FrustrationTS = make([]int64, len(summary.Frustrations))
+	summary.FrustrationSrc = make([]string, len(summary.Frustrations))
+	for i, f := range summary.Frustrations {
+		ref := -1
+		if i < len(frustrationRefs) {
+			ref = frustrationRefs[i]
+		}
+		summary.FrustrationTS[i], summary.FrustrationSrc[i] = resolve(ref, cited, f, tokenized)
+	}
+	for i := range summary.Issues {
+		is := &summary.Issues[i]
+		is.MomentTS, is.MomentSource = resolve(eventRef(is.Event), cited, is.Title+". "+is.Description, tokenized)
+	}
 }
 
 // TokenizeEvents converts raw rrweb event batches into a deduplicated,
 // signal-only event list.  Exported so callers outside this package can
 // compare fresh tokenization against a stored ai_tokenized value without
 // re-running the full analysis pipeline.
+// tokenTimeLayout keeps milliseconds: whole seconds made several actions in
+// the same second look simultaneous (and sorted them out of order), and a
+// finding's jump time could land up to a second early.
+const tokenTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+
 func TokenizeEvents(batches []models.EventBatch) []models.TokenizedEvent {
 	return tokenizeEvents(batches)
 }
@@ -179,7 +205,7 @@ func tokenizeEvents(batches []models.EventBatch) []models.TokenizedEvent {
 	for _, batch := range batches {
 		for _, e := range batch.Events {
 			te := models.TokenizedEvent{
-				T: time.Unix(0, e.Timestamp*int64(time.Millisecond)).Format(time.RFC3339),
+				T: time.Unix(0, e.Timestamp*int64(time.Millisecond)).Format(tokenTimeLayout),
 			}
 
 			switch {
@@ -195,13 +221,23 @@ func tokenizeEvents(batches []models.EventBatch) []models.TokenizedEvent {
 			case e.Type == 3:
 				continue // native rrweb mutation/mousemove noise - "click"/"input" above carry the real signal
 			case e.Subtype == "network":
-				if e.Status >= 400 {
+				switch {
+				case e.Status >= 400:
 					te.Action = "network_error"
 					te.Target = e.URL
 					te.Value = fmt.Sprintf("HTTP %d", e.Status)
-				} else {
+				case e.Status == 0 && e.Error != "":
+					// Never got a response (offline, DNS, CORS, timeout).
+					te.Action = "network_error"
+					te.Target = e.URL
+					te.Value = e.Error
+				default:
 					continue // only log errors
 				}
+			case e.Subtype == "navigate":
+				// Screen changes reported by an app (e.g. Flutter routes).
+				te.Action = "navigate"
+				te.Target = e.URL
 			case e.Subtype == "js_error":
 				te.Action = "js_error"
 				te.Target = e.Message
@@ -222,7 +258,7 @@ func tokenizeEvents(batches []models.EventBatch) []models.TokenizedEvent {
 		// Include custom events
 		for _, ce := range batch.CustomEvents {
 			events = append(events, models.TokenizedEvent{
-				T:      time.Unix(0, ce.Timestamp*int64(time.Millisecond)).Format(time.RFC3339),
+				T:      time.Unix(0, ce.Timestamp*int64(time.Millisecond)).Format(tokenTimeLayout),
 				Action: "custom:" + ce.Name,
 			})
 		}
@@ -282,7 +318,7 @@ func truncateEventsForPrompt(events []models.TokenizedEvent) []models.TokenizedE
 }
 
 func buildAnalysisPrompt(session *models.Session, events []models.TokenizedEvent) string {
-	eventsJSON, _ := json.MarshalIndent(truncateEventsForPrompt(events), "", "  ")
+	eventsJSON, _ := json.MarshalIndent(numberForPrompt(truncateEventsForPrompt(events)), "", "  ")
 	return fmt.Sprintf(`You are an AI session analyst for an enterprise product. Analyze this user session and return a JSON object.
 
 SESSION CONTEXT:
@@ -290,7 +326,7 @@ SESSION CONTEXT:
 - Duration: %dms
 - User Agent: %s
 
-USER ACTIONS (tokenized):
+USER ACTIONS (tokenized; "i" numbers each action):
 %s
 
 Return ONLY valid JSON with this exact structure, no markdown, no explanation:
@@ -298,7 +334,7 @@ Return ONLY valid JSON with this exact structure, no markdown, no explanation:
   "narrative": "2-3 sentence plain English summary of what the user did and what happened",
   "goal_achieved": true or false,
   "goal_evidence": "one sentence explaining why goal was or was not achieved",
-  "frustrations": ["array of frustration moments observed"],
+  "frustrations": [{"text": "a frustration moment observed", "event": i of the USER ACTIONS entry where it happens}],
   "key_moments": ["most important events in the session"],
   "tags": ["relevant tags like: form_error, rage_click, payment, abandoned, success, etc"],
   "issues": [
@@ -307,7 +343,8 @@ Return ONLY valid JSON with this exact structure, no markdown, no explanation:
       "title": "short issue title",
       "description": "what happened and why it's a problem",
       "severity": "P0|P1|P2|P3",
-      "tags": ["issue tags"]
+      "tags": ["issue tags"],
+      "event": i of the USER ACTIONS entry where it happens
     }
   ]
 }`,
@@ -318,7 +355,9 @@ Return ONLY valid JSON with this exact structure, no markdown, no explanation:
 	)
 }
 
-func parseAnalysisResponse(raw string) (*models.SessionSummary, error) {
+// parseAnalysisResponse also returns, per frustration, the event index the
+// model cited (-1 when it didn't).
+func parseAnalysisResponse(raw string) (*models.SessionSummary, []int, error) {
 	// Strip any markdown fences
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
@@ -329,7 +368,7 @@ func parseAnalysisResponse(raw string) (*models.SessionSummary, error) {
 	start := strings.Index(raw, "{")
 	end := strings.LastIndex(raw, "}")
 	if start == -1 || end == -1 {
-		return nil, fmt.Errorf("no JSON found in response")
+		return nil, nil, fmt.Errorf("no JSON found in response")
 	}
 	raw = raw[start : end+1]
 
@@ -350,12 +389,15 @@ func parseAnalysisResponse(raw string) (*models.SessionSummary, error) {
 	}
 
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	frustrations := make([]string, 0, len(result.Frustrations))
+	refs := make([]int, 0, len(result.Frustrations))
 	for _, f := range result.Frustrations {
-		frustrations = append(frustrations, stringifyTextEntry(f, "description"))
+		text, ref := frustrationEntry(f)
+		frustrations = append(frustrations, text)
+		refs = append(refs, ref)
 	}
 
 	keyMoments := make([]string, 0, len(result.KeyMoments))
@@ -371,7 +413,22 @@ func parseAnalysisResponse(raw string) (*models.SessionSummary, error) {
 		KeyMoments:   keyMoments,
 		Tags:         result.Tags,
 		Issues:       result.Issues,
-	}, nil
+	}, refs, nil
+}
+
+// frustrationEntry reads one frustration: a plain string (no citation) or
+// an object with the text under "text" or "description" and the cited
+// event under "event".
+func frustrationEntry(raw json.RawMessage) (string, int) {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		for _, k := range []string{"text", "description"} {
+			if v, _ := obj[k].(string); v != "" {
+				return v, eventRef(obj["event"])
+			}
+		}
+	}
+	return stringifyTextEntry(raw, "description"), -1
 }
 
 // stringifyTextEntry coerces a loosely-typed array entry (frustrations,

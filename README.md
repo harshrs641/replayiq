@@ -154,35 +154,62 @@ Paste this in any browser console to start recording immediately:
 <script>
   ReplayIQ.init({
     endpoint: 'https://your-replayiq-host',
-    projectId: 'your-project-id',
-    sampleRate: 1.0,      // 0.0–1.0, default 1.0
+    key: 'your-ingest-key',     // for now: the project id
+    sampleRate: 1.0,            // 0.0–1.0, default 1.0; decided once per session
+    pauseWhenHiddenMs: 60000,   // pause recording in a tab hidden this long (0 = never)
+    pauseWhenIdleMs: 600000,    // pause after this long with no input (0 = never)
     debug: false,
   });
 </script>
 ```
 
-### Option C — NPM module (coming soon)
+The script loads `rrweb.min.js` from the same folder, so the page's Content Security Policy only needs to allow your ReplayIQ host.
+
+### Option C — npm
 
 ```bash
-npm install @replayiq/sdk
+npm install @replayiq/web
 ```
 
 ```javascript
-import ReplayIQ from '@replayiq/sdk';
-
-ReplayIQ.init({
-  endpoint: 'https://your-replayiq-host',
-  projectId: 'your-project-id',
-});
-
-// Identify users
-ReplayIQ.identify('user-123', { plan: 'enterprise', email: 'user@co.com' });
-
-// Track custom events
-ReplayIQ.track('checkout_started', { cart_value: 99.99 });
+import ReplayIQ from '@replayiq/web';
+ReplayIQ.init({ endpoint: 'https://your-replayiq-host', key: 'your-ingest-key' });
 ```
 
----
+The package (source in [`sdk/web`](sdk/web) · [how it records](sdk/web/RECORDING.md)) also ships the script-tag build for CDNs (`https://cdn.jsdelivr.net/npm/@replayiq/web@1/dist/replayiq.min.js`). `npm run build` there regenerates `sdk/replayiq.js`, which this server serves.
+
+The SDK keeps its own cost on the page low:
+- **Sampling is decided once per session,** before anything is downloaded. A session that isn't sampled never loads rrweb and sends nothing, and a sampled one is recorded on every page it visits.
+- **rrweb loads after the page has loaded and the browser is idle.** Network, console and error capture start right away, so nothing from page startup is missed.
+- **Recording pauses** when a tab has been hidden for a minute or nobody has interacted for 10 minutes. It resumes with a fresh snapshot when the user comes back.
+- **Sending is reliable and small.** Batches are gzipped and retried with backoff under the same `batch_id`, so the server stores each batch once. They are also sent whenever the tab is hidden, because mobile browsers often close tabs without unloading the page.
+- **Consent:** `ReplayIQ.optOut()` and `ReplayIQ.optIn()`.
+
+### Flutter
+
+[`sdk/flutter`](sdk/flutter) · [how it records](sdk/flutter/RECORDING.md) (`replayiq_flutter`): `ReplayIQ.init(key:, endpoint:)` plus `ReplayIQ.navigatorObserver` records masked screenshots, touches, taps, navigation, console, errors and HTTP calls from iOS and Android Flutter apps. See its README for setup and masking.
+
+### How recordings reach storage
+
+```
+SDK ─▶ gateway ─▶ ingest API ─▶ Kafka events.native ─▶ transformer (processor) ─▶ events.raw / events.masked ─▶ storage
+```
+
+The ingest API only checks and accepts a batch (or answers 503 so the SDK retries). The transformer worker keeps mobile batches as sent (`sessions-native` bucket), converts screenshots and Native DOM recordings to rrweb (`internal/transform`), masks, and hands the result to the storage workers. Images and fonts that Native DOM recordings reference live in the `sessions-assets` bucket. Set `PUBLIC_API_URL` on the processor to the address dashboards use to reach the API. The all-in-one server does the same inline.
+
+### SDKs
+
+| Platform | Package | Records (details: each SDK's `RECORDING.md`) |
+|---|---|---|
+| Web | [`sdk/web`](sdk/web) (`@replayiq/web`) | rrweb DOM, clicks, inputs, console, network, errors |
+| Flutter | [`sdk/flutter`](sdk/flutter) (`replayiq_flutter`) | Native DOM (or screenshots), touches, navigation, HTTP, errors |
+| iOS (Swift) | [`sdk/ios`](sdk/ios) · [how it records](sdk/ios/RECORDING.md) (`ReplayIQ`) | Native DOM from the layer tree (or screenshots), touches, URLSession, crashes |
+| Android (Kotlin) | [`sdk/android`](sdk/android) · [how it records](sdk/android/RECORDING.md) (`com.replayiq:replayiq`) | Native DOM from the View tree / Compose (or screenshots), touches, OkHttp, crashes |
+| React Native | [`sdk/react-native`](sdk/react-native) · [how it records](sdk/react-native/RECORDING.md) (`@replayiq/react-native`) | Wraps the iOS and Android SDKs, plus JS errors, console and React Navigation screens |
+
+### Building an SDK for another platform
+
+Every SDK (web, Flutter, iOS, Android, React Native) talks to the same [Recording API v1](docs/sdk/recording-api-v1.md). It covers authentication, gzip, batching, retries, mobile screenshots and touches, and the shared app-event types. [Recording API v1.1](docs/sdk/recording-api-v1.1-native-dom.md) adds Native DOM recording for mobile, where the UI is sent as a tree of nodes and changes instead of screenshots, plus mobile-only signals.
 
 ## AI Session Analysis
 
@@ -213,7 +240,32 @@ Sessions are analyzed automatically after they end, or on demand via the dashboa
 
 **Layer 3 — Full rrweb Stream** (~200KB, frame-accurate replay)
 
-Available at `GET /api/v1/sessions/:id/replay` for exact DOM reconstruction.
+Available at `GET /api/v1/sessions/:id/replay` for exact DOM reconstruction (whole session in one response).
+
+For playback, the dashboard streams it like a video instead: it loads the first 20 s, keeps 15 s loaded ahead of the playhead, and on a seek fetches only the part around the new position.
+
+| Endpoint | Returns |
+|---|---|
+| `GET .../replay/manifest` | Timeline only: `start`, `end`, `keyframes` (FullSnapshot timestamps playback can start from), per-batch ranges. Reads no events. |
+| `GET .../replay/events?from=&to=` | Events with `from <= timestamp < to` (to extend what is already playing). |
+| `GET .../replay/events?at=&to=` | Jump: starts at the last keyframe at or before `at`, with a Meta event first so the chunk plays on its own. `from` in the response says where it starts. |
+| `GET .../replay/activity` | Navigation plus SDK-tagged events (clicks, inputs, console, network) for the Behaviour/Console/Network tabs. |
+
+All accept `masked=true|false` like `/replay` and are gzip-compressed (about 6x for DOM events). Once a session has ended, its chunks are cacheable by the browser for a day and its manifest for 5 minutes; sessions still recording are never cached.
+
+Each stored batch carries its time range and keyframes as object metadata, so the manifest is one listing call. Batches stored before that are read once to build their index, cached in memory; run `go run ./cmd/backfill-index` (from `backend/`, with the same `MINIO_*` env) once to write the index into them for good.
+
+**Live sessions:** while a session is still recording (no end signal yet, or ended under 2 minutes ago; a session with no events for 5 minutes stops counting), the manifest says `"live": true`. The player then opens at the newest moment and follows new events like a live stream (a **LIVE** / **GO LIVE** button under it):
+- **How new events arrive:** the player keeps `GET .../replay/live?after=<ms>` open, a server-sent event stream. The server checks storage every second and pushes the new manifest together with the events stored since the last update. Each update's `id` lets a reconnecting `EventSource` resume where it left off. When the session ends, the stream says `end` and closes.
+- **Markers:** errors, failed requests and rage clicks appear on a bar under the player as they arrive, and each one is clickable. rrweb-player positions its own markers only once, when it opens.
+
+**Finished sessions** are cached in the query service: where their replay is stored for 5 minutes, and their gzipped chunk and activity responses for an hour, up to 128 MB. Re-watching one costs no storage reads or compression.
+
+**Jump to findings:** `GET /api/v1/sessions/:id/moments` returns when each AI frustration and issue happened. The analysis prompt numbers the events and asks the model to cite the one each finding is about; findings without a usable citation, and sessions analysed before this, are placed by matching their text against the events (`source: "matched"`, shown as "≈"). How each time was found is stored with it, and older sessions are matched the first time they are viewed and saved, so matching runs once per finding. The dashboard puts a ▶ button on each finding, and the Issues tab has "Watch in replay".
+
+**Links:** `http://<dashboard>/?session=<id>&t=<seconds>` opens a session at that moment; "Copy link at this moment" above the player makes one.
+
+The web SDK takes a keyframe at least every 30 s of activity (`checkoutEveryNms`), so a seek never replays more than that. Mobile SDK batches are sent with `device_masked: true`: their pixels are masked on the phone, so no second, server-masked copy is stored and replays serve the single copy as "Masked on device".
 
 ### Trigger analysis manually
 
@@ -282,6 +334,17 @@ Mark elements in HTML:
 ```html
 <input data-riq-mask name="national-id" />
 ```
+
+### Retention
+
+Nothing is deleted by default. Set:
+
+```bash
+SESSION_RETENTION_DAYS=90                          # every project
+SESSION_RETENTION_DAYS_BY_PROJECT=acme=365,demo=7  # overrides; 0 = keep forever
+```
+
+The processor (or the all-in-one server) then deletes expired sessions at startup and every hour. Each session's stored events are deleted first, both the raw and the masked copy, then its row and AI issues. A session whose events fail to delete keeps its row and is retried on the next pass, so no event objects are left without a session.
 
 ---
 

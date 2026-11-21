@@ -1,0 +1,17 @@
+{
+  "name": "@replayiq/react-native",
+  "version": "1.0.0",
+  "description": "ReplayIQ session replay, errors and network capture for React Native apps (wraps the native iOS and Android SDKs)",
+  "license": "Apache-2.0",
+  "main": "src/index.ts",
+  "react-native": "src/index.ts",
+  "types": "src/index.ts",
+  "files": ["src", "ios", "android/src", "android/build.gradle", "replayiq-react-native.podspec", "README.md"],
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.74"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

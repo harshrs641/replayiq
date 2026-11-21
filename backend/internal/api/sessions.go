@@ -17,6 +17,7 @@ const (
 	actionEnd     = "end"
 	actionAnalyze = "analyze"
 	actionReplay  = "replay"
+	actionMoments = "moments"
 )
 
 // POST /api/v1/sessions — create session
@@ -31,10 +32,18 @@ func (r *router) handleSessions(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *router) createSession(w http.ResponseWriter, req *http.Request) {
+	body, err := readIngestBody(w, req, 64<<10)
+	if err != nil {
+		writeBodyError(w, err)
+		return
+	}
 	var s models.Session
-	if err := json.NewDecoder(req.Body).Decode(&s); err != nil {
+	if err := json.Unmarshal(body, &s); err != nil || s.ID == "" {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
+	}
+	if s.ProjectID == "" {
+		s.ProjectID = ingestKey(req)
 	}
 	s.StoragePath = fmt.Sprintf("sessions/%s", s.ID)
 	if err := r.cfg.DB.CreateSession(req.Context(), &s); err != nil {
@@ -79,7 +88,13 @@ func (r *router) handleSessionByID(w http.ResponseWriter, req *http.Request) {
 		r.endSession(w, req, sessionID)
 	case actionAnalyze:
 		r.triggerAnalysis(w, req, sessionID)
+	case actionMoments:
+		r.sessionMoments(w, req, sessionID)
 	case actionReplay:
+		if len(parts) == 3 && parts[2] != "" {
+			r.replayStream(w, req, sessionID, parts[2])
+			return
+		}
 		r.replaySession(w, req, sessionID)
 	default:
 		writeError(w, http.StatusNotFound, "unknown action")
@@ -102,7 +117,9 @@ func (r *router) endSession(w http.ResponseWriter, req *http.Request, sessionID 
 		EndedAt    string `json:"ended_at"`
 		DurationMs int64  `json:"duration_ms"`
 	}
-	json.NewDecoder(req.Body).Decode(&body)
+	if raw, err := readIngestBody(w, req, 16<<10); err == nil {
+		json.Unmarshal(raw, &body)
+	}
 	t, _ := time.Parse(time.RFC3339, body.EndedAt)
 	r.cfg.DB.EndSession(req.Context(), sessionID, t, body.DurationMs)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -145,11 +162,50 @@ func (r *router) triggerAnalysis(w http.ResponseWriter, req *http.Request, sessi
 // time, so the handler never holds the full session in memory regardless
 // of session size.
 func (r *router) replaySession(w http.ResponseWriter, req *http.Request, sessionID string) {
-	masked := req.URL.Query().Get("masked") != "false"
+	src := r.replaySourceFor(req.Context(), sessionID, req.URL.Query().Get("masked") != "false")
 	ctx := req.Context()
 
-	// Decide which bucket to stream from.
-	//
+	w.Header().Set("Content-Type", "application/json")
+	w, done := withGzip(w, req)
+	defer done()
+	w.WriteHeader(http.StatusOK)
+
+	fmt.Fprintf(w, `{"session_id":%q,"masked":%t,"device_masked":%t,"batches":[`, sessionID, src.Masked(), src.DeviceMasked)
+
+	if src.MaskedBucket {
+		r.cfg.MinIO.StreamSessionMaskedEvents(ctx, sessionID, w)
+	} else {
+		r.cfg.MinIO.StreamSessionEvents(ctx, sessionID, w)
+	}
+
+	fmt.Fprint(w, "]}")
+}
+
+// replaySource says which stored copy a replay request is served from.
+type replaySource struct {
+	// MaskedBucket: serve the server-masked copy (else the raw bucket).
+	MaskedBucket bool
+	// DeviceMasked: the recorder masked the session on the device, so the
+	// single raw copy is already the masked view.
+	DeviceMasked bool
+}
+
+// Masked reports whether what is served is masked.
+func (s replaySource) Masked() bool { return s.MaskedBucket || s.DeviceMasked }
+
+func (r *router) replaySourceFor(ctx context.Context, sessionID string, masked bool) replaySource {
+	if r.cfg.MinIO.IsDeviceMasked(ctx, sessionID) {
+		// One copy, masked on the device (data_mode "masked"): no masked
+		// copy is ever written and there is no unmasked view, whichever
+		// was asked for.
+		return replaySource{DeviceMasked: true}
+	}
+	return replaySource{MaskedBucket: r.useMaskedCopy(ctx, sessionID, masked)}
+}
+
+// useMaskedCopy reports whether the replay should be served from the masked
+// bucket.
+func (r *router) useMaskedCopy(ctx context.Context, sessionID string, masked bool) bool {
 	// When masked is requested we briefly poll for the masked objects: in the
 	// async (Kafka) pipeline the storage worker writes them shortly after
 	// ingest, so there is a small window right after session end where the
@@ -176,24 +232,7 @@ func (r *router) replaySession(w http.ResponseWriter, req *http.Request, session
 	}
 	// Fall back to raw only if: caller explicitly asked for raw, or masked
 	// events still don't exist (session predates masking feature).
-	useRaw := !masked || !hasMasked
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	maskedVal := "true"
-	if useRaw {
-		maskedVal = "false"
-	}
-	fmt.Fprintf(w, `{"session_id":%q,"masked":%s,"batches":[`, sessionID, maskedVal)
-
-	if useRaw {
-		r.cfg.MinIO.StreamSessionEvents(ctx, sessionID, w)
-	} else {
-		r.cfg.MinIO.StreamSessionMaskedEvents(ctx, sessionID, w)
-	}
-
-	fmt.Fprint(w, "]}")
+	return masked && hasMasked
 }
 
 // GET /api/v1/sessions/search?project_id=&q=&limit= — semantic search over

@@ -117,22 +117,17 @@ func (a *Analyzer) Analyze(ctx context.Context, sessionID string) error {
 		return fail("get events", fmt.Errorf("no events in MinIO after %d attempts", minioRetryAttempts))
 	}
 
-	// If a previous analysis exists, compare fresh tokenized events to the
-	// stored fingerprint — skip the LLM call when events are unchanged.
-	var summary *models.SessionSummary
-	if session.AITokenized != "" && session.AISummary != "" {
-		freshTokenized := ai.TokenizeEvents(batches)
-		freshJSON, _ := json.Marshal(freshTokenized)
-		if string(freshJSON) == session.AITokenized {
-			slog.Info("skipping LLM — events unchanged since last analysis", "id", sessionID)
-			summary = &models.SessionSummary{Narrative: session.AISummary}
-		}
+	// Events unchanged since the last analysis: its stored results (tags,
+	// frustrations, moments, issues) still hold, so keep them as they are.
+	if UnchangedSinceLastAnalysis(session, batches) {
+		slog.Info("skipping LLM — events unchanged since last analysis", "id", sessionID)
+		a.db.UpdateSessionAIStatus(ctx, sessionID, "complete", "")
+		return nil
 	}
-	if summary == nil {
-		summary, err = a.ai.AnalyzeSession(ctx, session, batches)
-		if err != nil {
-			return fail("ai analysis", err)
-		}
+
+	summary, err := a.ai.AnalyzeSession(ctx, session, batches)
+	if err != nil {
+		return fail("ai analysis", err)
 	}
 
 	if err := a.db.UpdateSessionAI(ctx, sessionID, summary); err != nil {
@@ -153,14 +148,16 @@ func (a *Analyzer) Analyze(ctx context.Context, sessionID string) error {
 
 	for _, detected := range summary.Issues {
 		issue := &models.AIIssue{
-			ID:          uuid.New().String(),
-			SessionID:   sessionID,
-			ProjectID:   session.ProjectID,
-			Type:        detected.Type,
-			Title:       detected.Title,
-			Description: detected.Description,
-			Severity:    detected.Severity,
-			Tags:        detected.Tags,
+			ID:           uuid.New().String(),
+			SessionID:    sessionID,
+			ProjectID:    session.ProjectID,
+			Type:         detected.Type,
+			Title:        detected.Title,
+			Description:  detected.Description,
+			Severity:     detected.Severity,
+			Tags:         detected.Tags,
+			MomentTS:     detected.MomentTS,
+			MomentSource: detected.MomentSource,
 		}
 		if err := a.db.CreateIssue(ctx, issue); err != nil {
 			slog.Error("create issue failed", "error", err)
@@ -170,4 +167,14 @@ func (a *Analyzer) Analyze(ctx context.Context, sessionID string) error {
 	a.db.UpdateSessionAIStatus(ctx, sessionID, "complete", "")
 	slog.Info("session analysis complete", "id", sessionID, "issues", len(summary.Issues))
 	return nil
+}
+
+// UnchangedSinceLastAnalysis reports whether a previous analysis exists and
+// was made from the same tokenized events as batches would produce now.
+func UnchangedSinceLastAnalysis(session *models.Session, batches []models.EventBatch) bool {
+	if session.AITokenized == "" || session.AISummary == "" {
+		return false
+	}
+	fresh, err := json.Marshal(ai.TokenizeEvents(batches))
+	return err == nil && string(fresh) == session.AITokenized
 }

@@ -19,7 +19,7 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,X-Project-ID,Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Content-Encoding,X-Project-ID,Authorization")
 		if req.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -50,3 +50,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap lets http.ResponseController reach the connection (flushing and
+// write deadlines for the live replay stream).
+func (rw *responseWriter) Unwrap() http.ResponseWriter { return rw.ResponseWriter }

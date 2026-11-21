@@ -7,7 +7,7 @@ backend/.dev/
 
 # Go binaries
 backend/replayiq-*
-replayiq-*
+/replayiq-*
 *.exe
 
 # Node
@@ -21,5 +21,12 @@ dashboard/dist/
 .idea/
 .vscode/
 
-# Claude Code session files
-.claude/
+# Claude Code session files (skills are shared and committed)
+**/.claude/*
+!**/.claude/skills/
+sdk/web/node_modules/
+sdk/web/dist/
+sdk/react-native/android/build/
+sdk/react-native/android/.gradle/
+sdk/react-native/android/.cxx/
+sdk/react-native/node_modules/

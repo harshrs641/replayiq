@@ -1,20 +1,23 @@
 package storage
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/harshrs641/replayiq/internal/models"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/harshrs641/replayiq/internal/models"
 )
 
 // EmbeddingDims must match the embedding model configured via EMBEDDING_MODEL
@@ -26,8 +29,8 @@ import (
 // recall degrades.  For enterprise deployments above that threshold, migrate
 // vectors to a dedicated vector database:
 //
-//   Qdrant  (https://qdrant.tech)          — self-hosted, REST/gRPC, filtering
-//   Weaviate (https://weaviate.io)         — self-hosted, GraphQL, hybrid search
+//	Qdrant  (https://qdrant.tech)          — self-hosted, REST/gRPC, filtering
+//	Weaviate (https://weaviate.io)         — self-hosted, GraphQL, hybrid search
 //
 // Migration path:
 //  1. Stand up Qdrant/Weaviate alongside Postgres.
@@ -56,9 +59,9 @@ func vectorLiteral(v []float64) string {
 
 // ─── Retention / cold archival ────────────────────────────────────────────────
 //
-// Hot-storage cost grows linearly with session volume.  For enterprise
-// deployments set SESSION_RETENTION_DAYS to delete (or detach) sessions older
-// than N days on each server startup.
+// Hot-storage cost grows linearly with session volume. Set
+// SESSION_RETENTION_DAYS (and SESSION_RETENTION_DAYS_BY_PROJECT) to delete
+// sessions older than N days, events and rows; see pipeline/retention.go.
 //
 // Archival strategy (implement before deleting):
 //  1. Export sessions older than retention window to S3/GCS as Parquet
@@ -67,7 +70,7 @@ func vectorLiteral(v []float64) string {
 //  3. Query the cold tier via Athena/BigQuery for historical analysis.
 //
 // With monthly partitioning (see enterprise partitioning DDL above)
-// PurgeOldSessions becomes a cheap DETACH PARTITION instead of a DELETE.
+// the row deletion can become a cheap DETACH PARTITION instead of a DELETE.
 
 type Postgres struct {
 	pool     *pgxpool.Pool // write pool (primary)
@@ -81,11 +84,40 @@ func (p *Postgres) r() *pgxpool.Pool { return p.readPool }
 // PurgeOldSessions deletes sessions (and their cascaded ai_issues rows)
 // that were created more than retentionDays ago.  Returns the number of
 // rows deleted.  Callers should export to cold storage before calling this.
-func (p *Postgres) PurgeOldSessions(ctx context.Context, retentionDays int) (int64, error) {
-	cutoff := time.Now().AddDate(0, 0, -retentionDays)
-	tag, err := p.pool.Exec(ctx,
-		`DELETE FROM sessions WHERE created_at < $1`, cutoff,
-	)
+// ExpiredSessionIDs returns up to limit sessions created before cutoff, of
+// project (or, when allProjects, of every project not in except).
+func (p *Postgres) ExpiredSessionIDs(ctx context.Context, project string, allProjects bool, except []string, cutoff time.Time, limit int) ([]string, error) {
+	query := `SELECT id FROM sessions WHERE project_id=$1 AND created_at < $2 ORDER BY created_at LIMIT $3`
+	args := []any{project, cutoff, limit}
+	if allProjects {
+		if except == nil {
+			except = []string{}
+		}
+		query = `SELECT id FROM sessions WHERE NOT (project_id = ANY($1)) AND created_at < $2 ORDER BY created_at LIMIT $3`
+		args[0] = except
+	}
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// DeleteSessions removes sessions' rows; their AI issues cascade.
+func (p *Postgres) DeleteSessions(ctx context.Context, ids []string) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tag, err := p.pool.Exec(ctx, `DELETE FROM sessions WHERE id = ANY($1)`, ids)
 	if err != nil {
 		return 0, err
 	}
@@ -175,15 +207,18 @@ func (p *Postgres) EndSession(ctx context.Context, sessionID string, endedAt tim
 func (p *Postgres) UpdateSessionAI(ctx context.Context, sessionID string, summary *models.SessionSummary) error {
 	tags, _ := json.Marshal(summary.Tags)
 	frustrations, _ := json.Marshal(summary.Frustrations)
+	frustrationTS, _ := json.Marshal(summary.FrustrationTS)
+	frustrationSrc, _ := json.Marshal(summary.FrustrationSrc)
 	tokenized, _ := json.Marshal(summary.TokenizedEvents)
 	now := time.Now()
 	_, err := p.pool.Exec(ctx, `
 		UPDATE sessions SET
 			ai_summary=$1, ai_tokenized=$2, ai_tags=$3,
-			ai_goal_achieved=$4, ai_frustrations=$5, ai_processed_at=$6
+			ai_goal_achieved=$4, ai_frustrations=$5, ai_processed_at=$6,
+			ai_frustration_ts=$8, ai_frustration_src=$9
 		WHERE id=$7`,
 		summary.Narrative, string(tokenized), tags,
-		summary.GoalAchieved, frustrations, now, sessionID,
+		summary.GoalAchieved, frustrations, now, sessionID, frustrationTS, frustrationSrc,
 	)
 	return err
 }
@@ -356,13 +391,78 @@ func (p *Postgres) ListSessions(ctx context.Context, projectID string, limit, of
 func (p *Postgres) CreateIssue(ctx context.Context, issue *models.AIIssue) error {
 	tags, _ := json.Marshal(issue.Tags)
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ai_issues (id, session_id, project_id, type, title, description, severity, tags, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())`,
+		INSERT INTO ai_issues (id, session_id, project_id, type, title, description, severity, tags, moment_ts, moment_source, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9, 0),NULLIF($10, ''),NOW())`,
 		issue.ID, issue.SessionID, issue.ProjectID,
 		issue.Type, issue.Title, issue.Description,
-		issue.Severity, tags,
+		issue.Severity, tags, issue.MomentTS, issue.MomentSource,
 	)
 	return err
+}
+
+// SessionMoments is what grounding a session's AI findings needs.
+type SessionMoments struct {
+	Tokenized      string
+	Frustrations   []string
+	FrustrationTS  []int64
+	FrustrationSrc []string
+	Issues         []*models.AIIssue
+}
+
+// GetSessionMoments loads a session's AI findings, their stored times (if
+// any) and the tokenized events to ground the ones without.
+func (p *Postgres) GetSessionMoments(ctx context.Context, sessionID string) (*SessionMoments, error) {
+	var out SessionMoments
+	var frustrations, ts, src []byte
+	err := p.r().QueryRow(ctx, `
+		SELECT COALESCE(ai_tokenized, ''), ai_frustrations, ai_frustration_ts, ai_frustration_src
+		FROM sessions WHERE id=$1`, sessionID,
+	).Scan(&out.Tokenized, &frustrations, &ts, &src)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal(frustrations, &out.Frustrations)
+	json.Unmarshal(ts, &out.FrustrationTS)
+	json.Unmarshal(src, &out.FrustrationSrc)
+
+	rows, err := p.r().Query(ctx, `
+		SELECT id, title, COALESCE(description, ''), COALESCE(moment_ts, 0), COALESCE(moment_source, '')
+		FROM ai_issues WHERE session_id=$1 ORDER BY created_at`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		iss := &models.AIIssue{SessionID: sessionID}
+		if err := rows.Scan(&iss.ID, &iss.Title, &iss.Description, &iss.MomentTS, &iss.MomentSource); err != nil {
+			return nil, err
+		}
+		out.Issues = append(out.Issues, iss)
+	}
+	return &out, rows.Err()
+}
+
+// SaveMoments stores findings' times placed after the analysis (sessions
+// analysed before findings carried a time), so they are matched only once.
+// frustrationTS/Src replace the session's arrays when non-nil.
+func (p *Postgres) SaveMoments(ctx context.Context, sessionID string, frustrationTS []int64, frustrationSrc []string, issues []*models.AIIssue) error {
+	if frustrationTS != nil {
+		ts, _ := json.Marshal(frustrationTS)
+		src, _ := json.Marshal(frustrationSrc)
+		if _, err := p.pool.Exec(ctx,
+			`UPDATE sessions SET ai_frustration_ts=$1, ai_frustration_src=$2 WHERE id=$3`,
+			ts, src, sessionID); err != nil {
+			return err
+		}
+	}
+	for _, is := range issues {
+		if _, err := p.pool.Exec(ctx,
+			`UPDATE ai_issues SET moment_ts=NULLIF($1, 0), moment_source=$2 WHERE id=$3 AND session_id=$4`,
+			is.MomentTS, is.MomentSource, is.ID, sessionID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *Postgres) UpdateIssueJira(ctx context.Context, issueID, jiraKey, jiraURL string) error {
@@ -375,7 +475,8 @@ func (p *Postgres) UpdateIssueJira(ctx context.Context, issueID, jiraKey, jiraUR
 
 func (p *Postgres) ListIssues(ctx context.Context, projectID string, limit int) ([]*models.AIIssue, error) {
 	rows, err := p.r().Query(ctx, `
-		SELECT id, session_id, project_id, type, title, description, severity, tags, jira_key, jira_url, created_at
+		SELECT id, session_id, project_id, type, title, description, severity, tags,
+			COALESCE(jira_key, ''), COALESCE(jira_url, ''), COALESCE(moment_ts, 0), created_at
 		FROM ai_issues WHERE project_id=$1 ORDER BY created_at DESC LIMIT $2`,
 		projectID, limit,
 	)
@@ -390,7 +491,7 @@ func (p *Postgres) ListIssues(ctx context.Context, projectID string, limit int) 
 		var tags []byte
 		rows.Scan(&iss.ID, &iss.SessionID, &iss.ProjectID, &iss.Type,
 			&iss.Title, &iss.Description, &iss.Severity, &tags,
-			&iss.JiraKey, &iss.JiraURL, &iss.CreatedAt)
+			&iss.JiraKey, &iss.JiraURL, &iss.MomentTS, &iss.CreatedAt)
 		json.Unmarshal(tags, &iss.Tags)
 		issues = append(issues, iss)
 	}
@@ -433,6 +534,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS embedding vector(%d);
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_status TEXT DEFAULT 'pending';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_error TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_frustration_ts JSONB;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_frustration_src JSONB;
 UPDATE sessions SET ai_status = 'complete' WHERE ai_status = 'pending' AND ai_processed_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
@@ -453,6 +556,9 @@ CREATE TABLE IF NOT EXISTS ai_issues (
 	jira_url    TEXT,
 	created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE ai_issues ADD COLUMN IF NOT EXISTS moment_ts BIGINT;
+ALTER TABLE ai_issues ADD COLUMN IF NOT EXISTS moment_source TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_issues_project ON ai_issues(project_id);
 CREATE INDEX IF NOT EXISTS idx_issues_session ON ai_issues(session_id);
@@ -506,6 +612,12 @@ type MinIO struct {
 	// enterprise deployment (e.g. the raw bucket locked down to a narrow
 	// set of principals, the masked bucket open to general support staff).
 	maskedBucket string
+	// nativeBucket keeps mobile batches as the SDK sent them, before
+	// conversion to rrweb (package ingest), so the conversion can be re-run.
+	nativeBucket string
+	// assetBucket holds images, islands and fonts that Native DOM
+	// recordings reference by hash, per project.
+	assetBucket string
 }
 
 func NewMinIO(endpoint, accessKey, secretKey, bucket, maskedBucket string, secure bool) (*MinIO, error) {
@@ -518,12 +630,14 @@ func NewMinIO(endpoint, accessKey, secretKey, bucket, maskedBucket string, secur
 	}
 
 	ctx := context.Background()
-	for _, b := range []string{bucket, maskedBucket} {
+	m := &MinIO{client: client, bucket: bucket, maskedBucket: maskedBucket,
+		nativeBucket: bucket + "-native", assetBucket: bucket + "-assets"}
+	for _, b := range []string{bucket, maskedBucket, m.nativeBucket, m.assetBucket} {
 		if err := ensureBucket(ctx, client, b); err != nil {
 			return nil, err
 		}
 	}
-	return &MinIO{client: client, bucket: bucket, maskedBucket: maskedBucket}, nil
+	return m, nil
 }
 
 func ensureBucket(ctx context.Context, client *minio.Client, bucket string) error {
@@ -543,6 +657,12 @@ func (m *MinIO) StoreEvents(ctx context.Context, sessionID string, batch *models
 	return m.store(ctx, m.bucket, sessionID, batch)
 }
 
+// StoreNativeEvents keeps a batch exactly as the SDK sent it (mobile
+// recordings, before conversion to rrweb).
+func (m *MinIO) StoreNativeEvents(ctx context.Context, sessionID string, batch *models.EventBatch) (string, error) {
+	return m.store(ctx, m.nativeBucket, sessionID, batch)
+}
+
 // StoreMaskedEvents persists the redacted copy of batch (see package
 // masking) under the same key shape as StoreEvents, but in maskedBucket -
 // this is the "*_masked" view the replay toggle reads by default.
@@ -557,17 +677,53 @@ func (m *MinIO) StoreMaskedEvents(ctx context.Context, sessionID string, batch *
 // overwrote the first, quietly dropping events from storage.
 var storeKeySeq atomic.Uint64
 
+// batchIDRe: batch ids safe to use in an object key.
+var batchIDRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+
+// store writes batch gzip-compressed. Event JSON compresses very well: rrweb
+// DOM payloads are repetitive, and mobile screenshot frames are near
+// duplicates of each other, so consecutive frames in one object shrink ~7x.
+// Readers go through openBatch, which also handles objects stored
+// uncompressed before this change.
 func (m *MinIO) store(ctx context.Context, bucket, sessionID string, batch *models.EventBatch) (string, error) {
-	data, err := json.Marshal(batch)
-	if err != nil {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(zw).Encode(batch); err != nil {
 		return "", err
 	}
-	seq := storeKeySeq.Add(1)
-	key := fmt.Sprintf("sessions/%s/%d-%d.json", sessionID, time.Now().UnixMilli(), seq)
-	_, err = m.client.PutObject(ctx, bucket, key, bytes.NewReader(data), int64(len(data)),
-		minio.PutObjectOptions{ContentType: "application/json"},
+	if err := zw.Close(); err != nil {
+		return "", err
+	}
+	key := fmt.Sprintf("sessions/%s/%d-%d.json.gz", sessionID, time.Now().UnixMilli(), storeKeySeq.Add(1))
+	if batchIDRe.MatchString(batch.BatchID) {
+		// Recording API v1: a retried batch overwrites itself.
+		key = fmt.Sprintf("sessions/%s/b-%s.json.gz", sessionID, batch.BatchID)
+	}
+	// Time index for streaming replay (see replay_index.go).
+	headers := make([]eventHeader, len(batch.Events))
+	for i, e := range batch.Events {
+		headers[i] = eventHeader{Type: e.Type, Timestamp: e.Timestamp, Subtype: e.Subtype}
+	}
+	md := indexEvents(headers).toMetadata()
+	if batch.DeviceMasked {
+		md[metaDeviceMasked] = "1"
+	}
+	_, err := m.client.PutObject(ctx, bucket, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()),
+		minio.PutObjectOptions{ContentType: "application/gzip", UserMetadata: md},
 	)
 	return key, err
+}
+
+// openBatch returns a reader over an object's JSON, transparently
+// decompressing gzip objects (detected by magic bytes, so legacy
+// uncompressed .json objects keep working).
+func openBatch(r io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(r)
+	magic, err := br.Peek(2)
+	if err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+		return gzip.NewReader(br)
+	}
+	return br, nil
 }
 
 func (m *MinIO) GetSessionEvents(ctx context.Context, sessionID string) ([]models.EventBatch, error) {
@@ -588,24 +744,50 @@ func (m *MinIO) GetSessionMaskedEvents(ctx context.Context, sessionID string) ([
 // alongside the new ones and double up events on replay. Callers that want
 // to regenerate a session's masked copy should call this first.
 func (m *MinIO) DeleteSessionMaskedEvents(ctx context.Context, sessionID string) error {
+	return m.deletePrefix(ctx, m.maskedBucket, sessionID)
+}
+
+// DeleteSessionEvents removes every stored object of a session, raw and
+// masked (retention).
+func (m *MinIO) DeleteSessionEvents(ctx context.Context, sessionID string) error {
+	for _, b := range []string{m.bucket, m.maskedBucket, m.nativeBucket} {
+		if err := m.deletePrefix(ctx, b, sessionID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *MinIO) deletePrefix(ctx context.Context, bucket, sessionID string) error {
+	if sessionID == "" || strings.Contains(sessionID, "/") {
+		return fmt.Errorf("invalid session id %q", sessionID)
+	}
 	prefix := fmt.Sprintf("sessions/%s/", sessionID)
+	listErr := make(chan error, 1)
 
 	objectsCh := make(chan minio.ObjectInfo)
 	go func() {
 		defer close(objectsCh)
-		for obj := range m.client.ListObjects(ctx, m.maskedBucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
-			if obj.Err == nil {
-				objectsCh <- obj
+		for obj := range m.client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+			if obj.Err != nil {
+				listErr <- obj.Err
+				return
 			}
+			objectsCh <- obj
 		}
+		listErr <- nil
 	}()
 
-	for result := range m.client.RemoveObjects(ctx, m.maskedBucket, objectsCh, minio.RemoveObjectsOptions{}) {
-		if result.Err != nil {
-			return result.Err
+	var removeErr error
+	for result := range m.client.RemoveObjects(ctx, bucket, objectsCh, minio.RemoveObjectsOptions{}) {
+		if result.Err != nil && removeErr == nil {
+			removeErr = result.Err
 		}
 	}
-	return nil
+	if err := <-listErr; err != nil {
+		return err
+	}
+	return removeErr
 }
 
 func (m *MinIO) getEvents(ctx context.Context, bucket, sessionID string) ([]models.EventBatch, error) {
@@ -621,7 +803,9 @@ func (m *MinIO) getEvents(ctx context.Context, bucket, sessionID string) ([]mode
 			continue
 		}
 		var batch models.EventBatch
-		json.NewDecoder(reader).Decode(&batch)
+		if body, err := openBatch(reader); err == nil {
+			json.NewDecoder(body).Decode(&batch)
+		}
 		reader.Close()
 		batches = append(batches, batch)
 	}
@@ -681,7 +865,14 @@ func (m *MinIO) streamEvents(ctx context.Context, bucket, sessionID string, w io
 				return count, err
 			}
 		}
-		_, copyErr := io.Copy(w, reader)
+		body, openErr := openBatch(reader)
+		if openErr != nil {
+			reader.Close()
+			return count, openErr
+		}
+		// json.Encoder (used by store) appends a newline; it is valid JSON
+		// whitespace inside the array the caller is building.
+		_, copyErr := io.Copy(w, body)
 		reader.Close()
 		if copyErr != nil {
 			return count, copyErr

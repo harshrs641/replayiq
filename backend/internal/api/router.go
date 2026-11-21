@@ -3,7 +3,9 @@
 package api
 
 import (
+	"github.com/harshrs641/replayiq/internal/ingest"
 	"net/http"
+	"time"
 
 	"github.com/harshrs641/replayiq/internal/ai"
 	"github.com/harshrs641/replayiq/internal/jira"
@@ -51,6 +53,9 @@ type RouterConfig struct {
 	JiraConfig  JiraConfig
 	Masking     masking.Config
 	MaskTracker *masking.Tracker
+	// Ingest processes batches inline in the all-in-one server (Producer
+	// nil); built from MinIO/Masking/MaskTracker when unset.
+	Ingest *ingest.Processor
 	// AnalysisConcurrency caps simultaneous Ollama analysis jobs (monolith
 	// mode only).  Zero uses defaultAnalysisConcurrency.
 	AnalysisConcurrency int
@@ -65,6 +70,10 @@ type router struct {
 	queryEmbedCache *embedCache
 	// eventLimiter enforces per-project burst limits on POST /api/v1/events.
 	eventLimiter *eventRateLimiter
+	// Replay data of finished sessions, which no longer changes (see
+	// replay_stream.go): where to read it, and gzipped response bodies.
+	replayIndexCache *lruCache[replayLookup]
+	replayBodyCache  *lruCache[[]byte]
 }
 
 func newBaseRouter(cfg RouterConfig) *router {
@@ -79,6 +88,10 @@ func newBaseRouter(cfg RouterConfig) *router {
 		mux:             http.NewServeMux(),
 		queryEmbedCache: newEmbedCache(1000),
 		eventLimiter:    newEventRateLimiter(20, 60),
+		// TTL: a regenerated masked copy (backfill-mask -force) shows up
+		// within 5 minutes, like the manifest's browser max-age.
+		replayIndexCache: newLRUCache[replayLookup](5000, 5*time.Minute),
+		replayBodyCache:  newLRUCache[[]byte](128<<20, time.Hour),
 	}
 }
 
@@ -112,12 +125,14 @@ func (r *router) ingestRoutes() {
 	r.mux.HandleFunc("/api/v1/sessions", r.handleSessions)
 	r.mux.HandleFunc("/api/v1/sessions/", r.handleSessionByID)
 	r.mux.HandleFunc("/api/v1/events", r.eventRateLimitMiddleware(r.handleEvents))
+	r.mux.HandleFunc("/api/v1/assets", r.uploadAsset)
 }
 
 // queryRoutes registers the read endpoints (session queries, replay, search,
 // issues, Jira, health, and SDK file serving).
 func (r *router) queryRoutes() {
 	r.mux.Handle("/sdk/", http.StripPrefix("/sdk/", http.FileServer(http.Dir(r.cfg.SDKPath))))
+	r.mux.HandleFunc("/api/v1/assets/", r.assetByPath)
 
 	for _, rt := range []struct {
 		pattern string
