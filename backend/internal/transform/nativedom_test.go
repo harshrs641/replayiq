@@ -57,7 +57,7 @@ func TestSnapshotToRRWeb(t *testing.T) {
 		`opacity:0.5;`, `transform:matrix(1,0,0,1,4,0);`, `overflow:hidden;`,
 		`"aria-label":"Pay now"`, `"data-role":"button"`,
 		`"tagName":"img"`, `"src":"https://riq.test/api/v1/assets/p/abc123"`, `object-fit:cover;`,
-		`"textContent":"••••••••••••••••"`, `outline:2px solid`, // input: never the value
+		`"textContent":"••••••••••••••••"`, `box-shadow:inset 0 -2px 0 #3b82f6`, // input: never the value
 		`repeating-linear-gradient(45deg`, // mask
 		`white-space:pre;`, `font-family:\"Inter\",-apple-system`,
 		`background:rgb(249,250,251);`,
@@ -96,6 +96,44 @@ func TestSnapshotToRRWeb(t *testing.T) {
 	walk(tree)
 	if len(seen) < 15 {
 		t.Fatalf("only %d nodes", len(seen))
+	}
+}
+
+func TestInputStyle(t *testing.T) {
+	snap := func(in string) string {
+		e := event(t, `{"type":5,"subtype":"ui_snapshot","timestamp":1000,"width":390,"height":844,"root":{"id":1,"k":"view","f":[0,0,390,844],"c":[
+		  {"id":2,"k":"input","f":[16,15,326,22],"in":`+in+`}]}}`)
+		return fmtJSON(Events([]models.RRWebEvent{e}, testOpt)[1].Data["node"])
+	}
+	style := `"tx":{"font":"system","size":17,"w":400,"col":"#FFFFFFFF","al":"left"},"pc":"#4DEBEBF5","pad":[0,0]`
+
+	// Typed text in the field's own colour and size, no generic inset.
+	page := snap(`{"type":"text","ph":"Full name","len":6,` + style + `}`)
+	for _, want := range []string{`"textContent":"••••••"`, `color:rgb(255,255,255);`, `font-size:17px;`, `padding:0 0px 0 0px;`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("filled field lacks %s: %s", want, page)
+		}
+	}
+	if strings.Contains(page, "padding:0 8px") || strings.Contains(page, "#9ca3af") {
+		t.Errorf("filled field uses the generic style: %s", page)
+	}
+
+	// Empty: the placeholder in its own colour.
+	page = snap(`{"type":"text","ph":"Full name",` + style + `}`)
+	if !strings.Contains(page, `"textContent":"Full name"`) || !strings.Contains(page, `color:rgba(235,235,245,0.3);`) {
+		t.Errorf("placeholder: %s", page)
+	}
+
+	// A filled password shows fixed dots (never its length), not the placeholder.
+	page = snap(`{"type":"password","ph":"Account password","filled":true,` + style + `}`)
+	if !strings.Contains(page, `"textContent":"••••••••"`) || strings.Contains(page, "Account password") {
+		t.Errorf("password: %s", page)
+	}
+
+	// Older SDKs (no tx): the generic field, as before.
+	page = snap(`{"type":"text","ph":"Card number"}`)
+	if !strings.Contains(page, "padding:0 8px") || !strings.Contains(page, "color:#9ca3af;") {
+		t.Errorf("legacy field: %s", page)
 	}
 }
 

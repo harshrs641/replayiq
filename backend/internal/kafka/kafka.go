@@ -77,6 +77,10 @@ func (p *Producer) writer(topic string) *kafkago.Writer {
 		// Producers split batches to ~800 KB (ingest.PublishBatch); this
 		// admits a single event that is larger on its own.
 		BatchBytes: MaxMessageBytes,
+		// Publish writes one message synchronously; kafka-go's default 1 s
+		// BatchTimeout made every ingest request wait a full second for a
+		// batch that never fills, capping each SDK at ~1 upload/s.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	p.writers[topic] = w
 	return w

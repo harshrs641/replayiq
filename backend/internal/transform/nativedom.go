@@ -110,6 +110,30 @@ type ndInput struct {
 	Focus bool   `json:"focus"`
 	// V: the field's value, sent only in raw recordings (never passwords).
 	V string `json:"v"`
+	// Optional (v1.2+): how the field draws its text, so the replay matches
+	// the app instead of a generic 15px grey box.
+	Tx     *ndText   `json:"tx"`     // font, size, weight, colour, alignment of the typed text
+	Pc     string    `json:"pc"`     // placeholder colour
+	Filled bool      `json:"filled"` // a secure field has content (no length is ever sent)
+	Pad    []float64 `json:"pad"`    // [left, right] text insets within the frame
+}
+
+// passwordDots stands in for a filled secure field: a fixed count, so the
+// replay never reveals the password's length.
+const passwordDots = "••••••••"
+
+// inputDisplay is what an input shows and whether that is its placeholder.
+func (c *converter) inputDisplay(in *ndInput) (string, bool) {
+	if in.V != "" && !c.opt.MaskNodes && in.Type != "password" {
+		return c.text(in.V), false
+	}
+	if in.Type == "password" && (in.Filled || in.Len > 0) {
+		return passwordDots, false
+	}
+	if in.Len > 0 {
+		return strings.Repeat("•", min(in.Len, 40)), false
+	}
+	return c.text(in.Ph), true
 }
 
 type ndFont struct {
@@ -297,13 +321,8 @@ func (c *converter) textValue(n ndNode) (string, bool) {
 		if n.In == nil {
 			return "", true
 		}
-		if n.In.V != "" && !c.opt.MaskNodes && n.In.Type != "password" {
-			return c.text(n.In.V), true
-		}
-		if n.In.Len > 0 {
-			return strings.Repeat("•", min(n.In.Len, 40)), true
-		}
-		return c.text(n.In.Ph), true
+		v, _ := c.inputDisplay(n.In)
+		return v, true
 	}
 	return "", false
 }
@@ -441,18 +460,62 @@ func (c *converter) css(n ndNode) string {
 			textCSS(&b, style, t.Ml, frameHeight(n))
 		}
 	case "input":
-		b.WriteString("display:flex;align-items:center;padding:0 8px;white-space:nowrap;overflow:hidden;")
-		b.WriteString("font:15px " + fontStack("") + ";")
-		if n.In != nil {
-			if n.In.Len == 0 && (n.In.V == "" || c.opt.MaskNodes) {
-				b.WriteString("color:#9ca3af;")
-			}
-			if n.In.Focus {
-				b.WriteString("outline:2px solid #3b82f6;")
-			}
-		}
+		inputCSS(&b, c, n.In)
 	}
 	return b.String()
+}
+
+// inputCSS styles an input. With the field's text style (`in.tx`) the text
+// sits exactly where the app draws it, in its font and colour; without it
+// (older SDKs) a generic 15px field with an 8px inset.
+func inputCSS(b *strings.Builder, c *converter, in *ndInput) {
+	b.WriteString("display:flex;align-items:center;white-space:pre;overflow:hidden;")
+	if in == nil {
+		b.WriteString("padding:0 8px;font:15px " + fontStack("") + ";")
+		return
+	}
+	_, placeholder := c.inputDisplay(in)
+	t := in.Tx
+	if t == nil {
+		b.WriteString("padding:0 8px;font:15px " + fontStack("") + ";")
+	} else {
+		left, right := 8.0, 8.0 // insets unknown (e.g. Compose): the generic inset
+		if len(in.Pad) == 2 {
+			left, right = in.Pad[0], in.Pad[1]
+		}
+		fmt.Fprintf(b, "padding:0 %s 0 %s;", px(right), px(left))
+		b.WriteString("font-family:" + fontStack(t.Font) + ";")
+		size := t.Size
+		if size <= 0 {
+			size = 15
+		}
+		b.WriteString("font-size:" + px(size) + ";")
+		if t.W > 0 {
+			b.WriteString("font-weight:" + strconv.Itoa(t.W) + ";")
+		}
+		if t.I {
+			b.WriteString("font-style:italic;")
+		}
+		switch t.Al {
+		case "center":
+			b.WriteString("justify-content:center;")
+		case "right", "end":
+			b.WriteString("justify-content:flex-end;")
+		}
+	}
+	switch {
+	case placeholder && in.Pc != "":
+		b.WriteString("color:" + color(in.Pc) + ";")
+	case placeholder:
+		b.WriteString("color:#9ca3af;")
+	case t != nil && t.Col != "":
+		b.WriteString("color:" + color(t.Col) + ";")
+	}
+	if in.Focus {
+		// A caret-coloured underline rather than a box: apps rarely draw a
+		// focus ring, but the viewer should still see which field is active.
+		b.WriteString("box-shadow:inset 0 -2px 0 #3b82f6;")
+	}
 }
 
 func frameHeight(n ndNode) float64 {
